@@ -2,13 +2,39 @@ import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
-function fitModel(model: THREE.Object3D) {
+/** Center the model at origin and normalize size so framing is consistent. */
+function prepareModel(model: THREE.Object3D) {
+  model.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(model);
-  const center = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
   const span = Math.max(size.x, size.y, size.z, 0.001);
   model.position.sub(center);
-  model.scale.setScalar(2.8 / span);
+  model.scale.setScalar(1 / span);
+  model.updateMatrixWorld(true);
+}
+
+/** Place camera so the whole object fits inside the viewport with margin. */
+function frameCamera(
+  camera: THREE.PerspectiveCamera,
+  object: THREE.Object3D,
+  aspect: number,
+) {
+  object.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(object);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z, 0.001);
+  const fov = THREE.MathUtils.degToRad(camera.fov);
+  const fitHeight = maxDim / (2 * Math.tan(fov / 2));
+  const fitWidth = fitHeight / Math.max(aspect, 0.001);
+  const distance = Math.max(fitHeight, fitWidth) * 1.55;
+  camera.position.set(center.x, center.y + maxDim * 0.04, center.z + distance);
+  camera.near = Math.max(0.01, distance / 100);
+  camera.far = distance * 100;
+  camera.lookAt(center);
+  camera.updateProjectionMatrix();
+  return { center, maxDim, distance };
 }
 
 /** Ordinary photo as a full surface coat — object-space projection, no mesh UV atlas. */
@@ -112,14 +138,17 @@ export default function ModelViewer({
     if (!host.current) return;
     const el = host.current;
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(34, 1, 0.01, 1000);
-    camera.position.set(0, 0.25, 4.7);
+    const camera = new THREE.PerspectiveCamera(32, 1, 0.01, 1000);
+    camera.position.set(0, 0.1, 3.2);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.15;
+    renderer.domElement.style.display = 'block';
+    renderer.domElement.style.width = '100%';
+    renderer.domElement.style.height = '100%';
     el.appendChild(renderer.domElement);
 
     const group = new THREE.Group();
@@ -128,13 +157,31 @@ export default function ModelViewer({
     const materials: THREE.Material[] = [];
     const textures: THREE.Texture[] = [];
     let cancelled = false;
+    let framed = false;
+
+    const grid = new THREE.GridHelper(4, 12, 0x4b4d4c, 0x292b2b);
+    grid.position.y = -0.55;
+    scene.add(grid);
+
+    const resize = () => {
+      const w = Math.max(1, el.clientWidth);
+      const h = Math.max(1, el.clientHeight);
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      if (framed && group.children.length) {
+        frameCamera(camera, group, camera.aspect);
+        const box = new THREE.Box3().setFromObject(group);
+        grid.position.y = box.min.y - 0.02;
+      }
+    };
 
     new GLTFLoader().load(
       modelUrl,
       async (gltf) => {
         if (cancelled) return;
         const model = gltf.scene;
-        fitModel(model);
+        prepareModel(model);
 
         let photoMat: THREE.MeshStandardMaterial | undefined;
         if (materialMapUrl) {
@@ -164,7 +211,11 @@ export default function ModelViewer({
           }
         });
 
-        if (!cancelled) group.add(model);
+        if (cancelled) return;
+        group.clear();
+        group.add(model);
+        framed = true;
+        resize();
       },
       undefined,
       () => {
@@ -179,10 +230,6 @@ export default function ModelViewer({
     const fill = new THREE.DirectionalLight(0xffffff, 1.2);
     fill.position.set(-3, 2, -2);
     scene.add(fill);
-
-    const grid = new THREE.GridHelper(5, 14, 0x4b4d4c, 0x292b2b);
-    grid.position.y = -1.55;
-    scene.add(grid);
 
     let down = false,
       lx = 0,
@@ -200,7 +247,11 @@ export default function ModelViewer({
       vx = (e.clientX - lx) * 0.01;
       vy = (e.clientY - ly) * 0.007;
       group.rotation.y += vx;
-      group.rotation.x += vy;
+      group.rotation.x = THREE.MathUtils.clamp(
+        group.rotation.x + vy,
+        -0.85,
+        0.85,
+      );
       lx = e.clientX;
       ly = e.clientY;
     };
@@ -211,13 +262,6 @@ export default function ModelViewer({
     el.addEventListener('pointermove', move);
     el.addEventListener('pointerup', end);
 
-    const resize = () => {
-      const w = el.clientWidth,
-        h = el.clientHeight;
-      renderer.setSize(w, h, false);
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-    };
     resize();
     const ro = new ResizeObserver(resize);
     ro.observe(el);
@@ -228,7 +272,8 @@ export default function ModelViewer({
         vx *= 0.94;
         vy *= 0.94;
         group.rotation.y += 0.003 + vx;
-        group.rotation.x += vy;
+        group.rotation.x += vy * 0.2;
+        group.rotation.x = THREE.MathUtils.clamp(group.rotation.x, -0.85, 0.85);
       }
       renderer.render(scene, camera);
       frame = requestAnimationFrame(tick);
