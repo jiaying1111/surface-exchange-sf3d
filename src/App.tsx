@@ -12,8 +12,10 @@ import {
   X,
 } from 'lucide-react';
 import ModelViewer from './model-viewer';
-import TextureAtlas from './texture-atlas';
 import Gallery, { GalleryEntry } from './gallery';
+import { prepareContinuousSkin } from './skin-transfer';
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 type Obj = {
   name: string;
@@ -21,9 +23,53 @@ type Obj = {
   data: string;
   modelUrl?: string;
   modelFile?: File;
+  /** Gallery archive id when reopened from Gallery. */
+  galleryId?: string;
 };
 type Phase = 'idle' | 'geometry' | 'ready' | 'swapped';
-type Atlases = { a?: string; b?: string };
+/** Ordinary material maps (photos, or continuous skins from GLB). */
+type Maps = { a?: string; b?: string };
+
+/** Pull albedo from a GLB, then fill packing gaps into one ordinary wrap map. */
+async function mapFromModel(modelUrl: string) {
+  const atlas = await new Promise<string>((resolve, reject) => {
+    new GLTFLoader().load(
+      modelUrl,
+      (gltf) => {
+        let image: CanvasImageSource | undefined;
+        gltf.scene.traverse((node) => {
+          if (image || !(node as THREE.Mesh).isMesh) return;
+          const material = (node as THREE.Mesh).material as
+            | THREE.MeshStandardMaterial
+            | THREE.MeshStandardMaterial[];
+          const first = Array.isArray(material) ? material[0] : material;
+          image = first?.map?.image as CanvasImageSource | undefined;
+        });
+        if (!image) {
+          reject(new Error('No material map in this GLB.'));
+          return;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = 1024;
+        const ctx = canvas.getContext('2d')!;
+        ctx.drawImage(image, 0, 0, 1024, 1024);
+        resolve(canvas.toDataURL('image/png'));
+      },
+      undefined,
+      () => reject(new Error('Could not read material from GLB.')),
+    );
+  });
+  return prepareContinuousSkin(atlas);
+}
+
+async function resolveMap(obj: Obj, side: 'a' | 'b') {
+  if (obj.data) return obj.data;
+  if (obj.galleryId) {
+    return `/api/gallery/${obj.galleryId}/surface-${side}.png`;
+  }
+  if (!obj.modelUrl) throw new Error('Missing model.');
+  return mapFromModel(obj.modelUrl);
+}
 
 const fileData = (file: File) =>
   new Promise<string>((resolve, reject) => {
@@ -58,22 +104,51 @@ function explainFailure(error: unknown) {
   if (/load failed|failed to fetch|networkerror|bad gateway|502/i.test(raw)) {
     return 'Network failed while talking to Stable Fast 3D. Check that the API server is running and your Hugging Face token is valid.';
   }
+  if (/string did not match the expected pattern|InvalidCharacterError/i.test(raw)) {
+    return 'Image could not be decoded. Use a smaller PNG or JPEG and try again.';
+  }
   return raw || 'Stable Fast 3D generation failed';
+}
+
+async function dataUrlToBlob(dataUrl: string) {
+  const match = dataUrl.match(
+    /^data:([^;,]+)?(?:;charset=[^;,]+)?(;base64)?,(.*)$/i,
+  );
+  if (!match) throw new Error('Could not read image data.');
+  const mime = (match[1] || 'image/jpeg').replace('image/jpg', 'image/jpeg');
+  const isBase64 = Boolean(match[2]);
+  const payload = match[3] || '';
+  if (!isBase64) {
+    return new Blob([decodeURIComponent(payload)], { type: mime });
+  }
+  let b64 = payload.replace(/\s/g, '');
+  const pad = b64.length % 4;
+  if (pad) b64 += '='.repeat(4 - pad);
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+async function urlToBlob(url: string) {
+  if (url.startsWith('data:')) return dataUrlToBlob(url);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error('Could not load image.');
+  return response.blob();
 }
 
 async function generateOne(image: string, token: string) {
   let response: Response;
   try {
+    const prepared = await prepareImage(image);
+    const blob = await dataUrlToBlob(prepared);
+    const form = new FormData();
+    form.append('image', blob, 'photo.jpg');
+    form.append('token', token.trim());
     response = await fetch('/api/sf3d', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-hf-token': token.trim(),
-      },
-      body: JSON.stringify({
-        image: await prepareImage(image),
-        token: token.trim(),
-      }),
+      headers: { 'x-hf-token': token.trim() },
+      body: form,
     });
   } catch (error) {
     throw new Error(explainFailure(error));
@@ -266,7 +341,7 @@ export default function Home() {
     [b, setB] = useState<Obj | null>(null),
     [phase, setPhase] = useState<Phase>('idle'),
     [detached, setDetached] = useState(false),
-    [atlases, setAtlases] = useState<Atlases>({}),
+    [maps, setMaps] = useState<Maps>({}),
     [progress, setProgress] = useState<[number, number]>([0, 0]),
     [error, setError] = useState(''),
     [archiveState, setArchiveState] = useState<
@@ -285,7 +360,7 @@ export default function Home() {
     side === 'a' ? setA(next) : setB(next);
     setPhase('idle');
     setDetached(false);
-    setAtlases({});
+    setMaps({});
     setError('');
     setProgress([0, 0]);
     setArchiveState('idle');
@@ -298,7 +373,7 @@ export default function Home() {
     setError('');
     setPhase('geometry');
     setDetached(false);
-    setAtlases({});
+    setMaps({});
     setProgress([8, 8]);
     try {
       const who = await fetch('/api/hf/whoami', {
@@ -333,7 +408,7 @@ export default function Home() {
     setB(null);
     setPhase('idle');
     setDetached(false);
-    setAtlases({});
+    setMaps({});
     setError('');
     setProgress([0, 0]);
     setArchiveState('idle');
@@ -343,26 +418,52 @@ export default function Home() {
     reset();
     setA({
       name: entry.a.name.replace(/\.glb$/i, ''),
-      preview: '',
+      preview: `/api/gallery/${entry.id}/surface-a.png`,
       data: '',
       modelUrl: `/api/gallery/${entry.id}/a.glb`,
+      galleryId: entry.id,
     });
     setB({
       name: entry.b.name.replace(/\.glb$/i, ''),
-      preview: '',
+      preview: `/api/gallery/${entry.id}/surface-b.png`,
       data: '',
       modelUrl: `/api/gallery/${entry.id}/b.glb`,
+      galleryId: entry.id,
     });
     setPhase('ready');
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const [detaching, setDetaching] = useState(false);
+
+  const detach = async () => {
+    if (!a?.modelUrl || !b?.modelUrl || detaching) return;
+    setError('');
+    setDetaching(true);
+    try {
+      const [mapA, mapB] = await Promise.all([
+        resolveMap(a, 'a'),
+        resolveMap(b, 'b'),
+      ]);
+      setMaps({ a: mapA, b: mapB });
+      setDetached(true);
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? e.message
+          : 'Could not detach material maps from these models.',
+      );
+    } finally {
+      setDetaching(false);
+    }
   };
 
   const archive = async () => {
     if (
       !a?.modelFile ||
       !b?.modelFile ||
-      !atlases.a ||
-      !atlases.b ||
+      !maps.a ||
+      !maps.b ||
       archiveState === 'saving'
     )
       return;
@@ -373,19 +474,15 @@ export default function Home() {
       form.append('b', b.modelFile);
       form.append(
         'surfaceA',
-        new File(
-          [await fetch(atlases.a).then((r) => r.blob())],
-          'surface-a.png',
-          { type: 'image/png' },
-        ),
+        new File([await urlToBlob(maps.a)], 'surface-a.png', {
+          type: 'image/png',
+        }),
       );
       form.append(
         'surfaceB',
-        new File(
-          [await fetch(atlases.b).then((r) => r.blob())],
-          'surface-b.png',
-          { type: 'image/png' },
-        ),
+        new File([await urlToBlob(maps.b)], 'surface-b.png', {
+          type: 'image/png',
+        }),
       );
       const response = await fetch('/api/gallery', {
         method: 'POST',
@@ -411,74 +508,32 @@ export default function Home() {
   const busy = phase === 'geometry',
     generated = !!(a?.modelUrl && b?.modelUrl),
     swapped = phase === 'swapped',
-    mapsReady = !!(atlases.a && atlases.b);
+    mapsReady = !!(maps.a && maps.b);
 
   return (
     <main>
-      <header className="site-header">
+      <header className="site-header site-header-simple">
         <a className="wordmark" href="#">
           SURFACE
           <br />
           EXCHANGE
         </a>
-        <div className="edition">
-          OPEN MODEL STUDY <span>№ 06</span>
-        </div>
-        <button className="reset-top" onClick={reset}>
+        <button className="reset-top" onClick={reset} type="button">
           <RotateCcw size={15} /> reset
         </button>
       </header>
-
-      <div className="intro three-intro">
-        <div>
-          <span className="kicker">
-            IMAGE → SF3D MESH → DETACH MATERIAL → SWAP MAPS
-          </span>
-          <h1>
-            Two real bodies.
-            <br />
-            <em>Borrowed skins.</em>
-          </h1>
-        </div>
-        <div className="steps">
-          <div className={a && b ? 'done' : ''}>
-            <b>01</b>
-            <span>
-              upload
-              <br />
-              objects
-            </span>
-          </div>
-          <div className={generated ? 'done' : ''}>
-            <b>02</b>
-            <span>
-              generate
-              <br />
-              3D bodies
-            </span>
-          </div>
-          <div className={detached ? 'done' : ''}>
-            <b>03</b>
-            <span>
-              detach
-              <br />
-              materials
-            </span>
-          </div>
-        </div>
-      </div>
 
       <div className={`lab ${busy ? 'generating' : ''}`}>
         <Slot
           label="OBJECT A"
           obj={a}
-          materialMapUrl={swapped ? atlases.b : undefined}
+          materialMapUrl={swapped ? maps.b : undefined}
           onPick={(f) => pick('a', f)}
           onClear={() => {
             setA(null);
             setPhase('idle');
             setDetached(false);
-            setAtlases({});
+            setMaps({});
           }}
         />
         <div className="lab-control">
@@ -499,31 +554,25 @@ export default function Home() {
           ) : detached && a?.modelUrl && b?.modelUrl ? (
             <div className="between-surfaces">
               <div className="between-note">
-                MATERIALS DETACHED.
+                ORDINARY PHOTO MAPS.
                 <br />
-                SWAP THE TWO MAPS.
+                SWAP THEM BETWEEN BODIES.
               </div>
-              <TextureAtlas
-                modelUrl={a.modelUrl}
-                label="MATERIAL A"
-                onReady={(atlas) =>
-                  setAtlases((current) => ({ ...current, a: atlas }))
-                }
-              />
-              <TextureAtlas
-                modelUrl={b.modelUrl}
-                label="MATERIAL B"
-                onReady={(atlas) =>
-                  setAtlases((current) => ({ ...current, b: atlas }))
-                }
-              />
+              <article className="surface-map">
+                <img src={maps.a} alt="Material A photo" />
+                <b>MATERIAL A</b>
+              </article>
+              <article className="surface-map">
+                <img src={maps.b} alt="Material B photo" />
+                <b>MATERIAL B</b>
+              </article>
               <button
                 className="swap3d exchange-button"
                 disabled={!mapsReady}
                 onClick={exchange}
               >
                 <ArrowLeftRight size={18} />
-                {mapsReady ? (swapped ? 'RESTORE' : 'SWAP MAPS') : 'READING…'}
+                {swapped ? 'RESTORE' : 'SWAP MAPS'}
               </button>
             </div>
           ) : (
@@ -544,13 +593,23 @@ export default function Home() {
               )}
               <button
                 className="detach-button"
-                disabled={!generated}
-                onClick={() => setDetached(true)}
+                disabled={!generated || detaching}
+                onClick={() => void detach()}
               >
                 <Scissors size={16} />
-                DETACH BOTH
-                <br />
-                MATERIALS
+                {detaching ? (
+                  <>
+                    READING
+                    <br />
+                    MAPS…
+                  </>
+                ) : (
+                  <>
+                    DETACH BOTH
+                    <br />
+                    MATERIALS
+                  </>
+                )}
               </button>
             </>
           )}
@@ -558,9 +617,9 @@ export default function Home() {
             {busy
               ? 'The free GPU may queue. Keep this tab open while both bodies form.'
               : detached
-                ? 'Materials are detached. Swap simply exchanges the two albedo maps.'
+                ? 'Two ordinary photos are detached as maps. Swap paints each photo onto the other body — no UV atlas grid.'
                 : generated
-                  ? 'Detach both materials, then swap their texture maps.'
+                  ? 'Detach materials from the photos when available, or from each GLB map if you reopened a Gallery pair.'
                   : "Add two isolated photos. Generation runs on this app's own Node API via Hugging Face Stable Fast 3D."}
           </p>
           {error && (
@@ -574,13 +633,13 @@ export default function Home() {
         <Slot
           label="OBJECT B"
           obj={b}
-          materialMapUrl={swapped ? atlases.a : undefined}
+          materialMapUrl={swapped ? maps.a : undefined}
           onPick={(f) => pick('b', f)}
           onClear={() => {
             setB(null);
             setPhase('idle');
             setDetached(false);
-            setAtlases({});
+            setMaps({});
           }}
         />
       </div>

@@ -11,25 +11,80 @@ function fitModel(model: THREE.Object3D) {
   model.scale.setScalar(2.8 / span);
 }
 
-function asStandard(
-  source: THREE.Material | THREE.Material[],
-  mapOverride?: THREE.Texture,
-) {
+/** Ordinary photo as a full surface coat — object-space projection, no mesh UV atlas. */
+function makePhotoMaterial(map: THREE.Texture) {
+  map.colorSpace = THREE.SRGBColorSpace;
+  map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
+  map.needsUpdate = true;
+
+  const material = new THREE.MeshStandardMaterial({
+    map,
+    color: 0xffffff,
+    roughness: 0.72,
+    metalness: 0,
+  });
+
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uPhotoScale = { value: 0.42 };
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+varying vec3 vPhotoPos;
+varying vec3 vPhotoNormal;`,
+      )
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+vPhotoPos = transformed;
+vPhotoNormal = normalize(normal);`,
+      );
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+varying vec3 vPhotoPos;
+varying vec3 vPhotoNormal;
+uniform float uPhotoScale;
+
+vec4 samplePhotoCoat(sampler2D tex, vec3 pos, vec3 nor) {
+  vec3 blend = abs(normalize(nor));
+  blend = pow(max(blend, vec3(0.0001)), vec3(4.0));
+  blend /= (blend.x + blend.y + blend.z);
+  vec2 ux = clamp(pos.zy * uPhotoScale + 0.5, 0.0, 1.0);
+  vec2 uy = clamp(pos.xz * uPhotoScale + 0.5, 0.0, 1.0);
+  vec2 uz = clamp(pos.xy * uPhotoScale + 0.5, 0.0, 1.0);
+  return texture2D(tex, ux) * blend.x
+       + texture2D(tex, uy) * blend.y
+       + texture2D(tex, uz) * blend.z;
+}`,
+      )
+      .replace(
+        '#include <map_fragment>',
+        `#ifdef USE_MAP
+  vec4 sampledDiffuseColor = samplePhotoCoat(map, vPhotoPos, vPhotoNormal);
+  diffuseColor *= sampledDiffuseColor;
+#endif`,
+      );
+  };
+
+  material.customProgramCacheKey = () => 'ordinary-photo-coat';
+  return material;
+}
+
+function asOriginal(source: THREE.Material | THREE.Material[]) {
   const first = (Array.isArray(source) ? source[0] : source) as
     | THREE.MeshStandardMaterial
-    | THREE.MeshBasicMaterial
     | undefined;
-  const map =
-    mapOverride ||
-    ('map' in (first || {}) ? (first as THREE.MeshStandardMaterial).map : null);
+  const map = first?.map || null;
   if (map) {
     map.colorSpace = THREE.SRGBColorSpace;
-    map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
     map.needsUpdate = true;
   }
   return new THREE.MeshStandardMaterial({
-    map: map || null,
-    color: map ? 0xffffff : first && 'color' in first ? first.color : 0xcccccc,
+    map,
+    color: map ? 0xffffff : first?.color || 0xcccccc,
     roughness: 0.72,
     metalness: 0,
   });
@@ -48,7 +103,7 @@ export default function ModelViewer({
 }: {
   modelUrl: string;
   label: string;
-  /** Other object's detached albedo — swapped onto this body as a plain material map. */
+  /** Other object's ordinary photo — painted onto this body. */
   materialMapUrl?: string;
 }) {
   const host = useRef<HTMLDivElement>(null);
@@ -81,15 +136,17 @@ export default function ModelViewer({
         const model = gltf.scene;
         fitModel(model);
 
-        let override: THREE.Texture | undefined;
+        let photoMat: THREE.MeshStandardMaterial | undefined;
         if (materialMapUrl) {
           try {
-            override = await loadTexture(materialMapUrl);
+            const tex = await loadTexture(materialMapUrl);
             if (cancelled) {
-              override.dispose();
+              tex.dispose();
               return;
             }
-            textures.push(override);
+            textures.push(tex);
+            photoMat = makePhotoMaterial(tex);
+            materials.push(photoMat);
           } catch {
             el.dataset.error = 'true';
           }
@@ -98,9 +155,13 @@ export default function ModelViewer({
         model.traverse((node) => {
           const mesh = node as THREE.Mesh;
           if (!mesh.isMesh) return;
-          const material = asStandard(mesh.material, override);
-          materials.push(material);
-          mesh.material = material;
+          if (photoMat) {
+            mesh.material = photoMat;
+          } else {
+            const material = asOriginal(mesh.material);
+            materials.push(material);
+            mesh.material = material;
+          }
         });
 
         if (!cancelled) group.add(model);
@@ -195,7 +256,7 @@ export default function ModelViewer({
       aria-label={`${label} uploaded 3D model`}
     >
       <span className="mesh-badge">
-        {materialMapUrl ? 'SWAPPED MATERIAL' : 'ORIGINAL MATERIAL'}
+        {materialMapUrl ? 'SWAPPED PHOTO MAP' : 'ORIGINAL MATERIAL'}
       </span>
       <span className="orbit-hint">drag to orbit</span>
       <span className="axis">X&nbsp;&nbsp;Y&nbsp;&nbsp;Z</span>

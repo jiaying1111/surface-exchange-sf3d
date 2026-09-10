@@ -23,10 +23,21 @@ function cleanToken(value: unknown) {
 }
 
 function dataUrlToBlob(dataUrl: string) {
-  const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);
+  const match = dataUrl.match(
+    /^data:(image\/(?:png|jpe?g|webp));base64,([\s\S]+)$/i,
+  );
   if (!match) throw new Error('Please upload a PNG, JPEG, or WebP image.');
-  const bytes = Uint8Array.from(atob(match[2]), (char) => char.charCodeAt(0));
-  return new Blob([bytes], { type: match[1] });
+  let b64 = match[2].replace(/\s/g, '');
+  const pad = b64.length % 4;
+  if (pad) b64 += '='.repeat(4 - pad);
+  try {
+    const mime = match[1].toLowerCase().replace('image/jpg', 'image/jpeg');
+    return new Blob([Buffer.from(b64, 'base64')], { type: mime });
+  } catch {
+    throw new Error(
+      'Image data was corrupted while uploading. Try a smaller PNG or JPEG.',
+    );
+  }
 }
 
 async function imageFromRequest(req: Request) {
@@ -48,6 +59,9 @@ function explain(raw: string) {
   }
   if (raw === 'An error occurred') {
     return 'Stable Fast 3D GPU is temporarily unavailable. Wait a minute and try again.';
+  }
+  if (/string did not match the expected pattern|InvalidCharacterError/i.test(raw)) {
+    return 'Image upload could not be decoded. Use a smaller PNG or JPEG and try again.';
   }
   if (/401|Unauthorized|Invalid username or password|Invalid credentials/i.test(raw)) {
     return 'Hugging Face rejected this token. Create a user access token (Read) at https://huggingface.co/settings/tokens while logged into your Pro account.';
