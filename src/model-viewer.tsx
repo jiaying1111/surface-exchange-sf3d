@@ -2,89 +2,150 @@ import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
-/** Flood atlas packing gaps so the borrowed skin can coat the whole body. */
-function densifyAtlas(source: CanvasImageSource): THREE.CanvasTexture {
+function loadImage(url: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Could not load surface atlas.'));
+    img.src = url;
+  });
+}
+
+/**
+ * Turn a packed UV atlas (with black gutters) into a continuous "coat" material
+ * that can wrap another body without showing atlas packing holes.
+ */
+async function atlasToCoatTexture(atlasUrl: string) {
+  const img = await loadImage(atlasUrl);
   const size = 1024;
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, size, size);
-  ctx.drawImage(source as CanvasImageSource, 0, 0, size, size);
+  ctx.drawImage(img, 0, 0, size, size);
 
-  const img = ctx.getImageData(0, 0, size, size);
-  const { data } = img;
-  const isInk = (i: number) =>
-    data[i] + data[i + 1] + data[i + 2] < 40 && data[i + 3] > 8;
+  const image = ctx.getImageData(0, 0, size, size);
+  const { data } = image;
+  const valid = new Uint8Array(size * size);
+  let meanR = 0,
+    meanG = 0,
+    meanB = 0,
+    count = 0;
+  let minX = size,
+    minY = size,
+    maxX = 0,
+    maxY = 0;
 
-  let r = 0,
-    g = 0,
-    b = 0,
-    n = 0;
-  for (let i = 0; i < data.length; i += 4) {
-    if (isInk(i)) continue;
-    r += data[i];
-    g += data[i + 1];
-    b += data[i + 2];
-    n++;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = y * size + x;
+      const o = i * 4;
+      const luma =
+        0.299 * data[o] + 0.587 * data[o + 1] + 0.114 * data[o + 2];
+      if (luma > 16 && data[o + 3] > 8) {
+        valid[i] = 1;
+        meanR += data[o];
+        meanG += data[o + 1];
+        meanB += data[o + 2];
+        count++;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
   }
-  const mean: [number, number, number] = n
-    ? [r / n, g / n, b / n]
-    : [180, 60, 50];
 
-  // Dilate colored texels into nearby black packing several times.
-  let cur = new Uint8ClampedArray(data);
-  for (let pass = 0; pass < 10; pass++) {
-    const next = new Uint8ClampedArray(cur);
-    for (let y = 1; y < size - 1; y++) {
-      for (let x = 1; x < size - 1; x++) {
-        const i = (y * size + x) * 4;
-        if (cur[i] + cur[i + 1] + cur[i + 2] >= 40) continue;
-        let best = -1,
-          br = 0,
-          bg = 0,
-          bb = 0;
-        for (let oy = -1; oy <= 1; oy++) {
-          for (let ox = -1; ox <= 1; ox++) {
-            if (!ox && !oy) continue;
-            const j = ((y + oy) * size + (x + ox)) * 4;
-            const s = cur[j] + cur[j + 1] + cur[j + 2];
-            if (s > best) {
-              best = s;
-              br = cur[j];
-              bg = cur[j + 1];
-              bb = cur[j + 2];
-            }
+  if (count > 0) {
+    meanR /= count;
+    meanG /= count;
+    meanB /= count;
+  } else {
+    meanR = meanG = meanB = 128;
+  }
+
+  // Grow valid surface colors into black packing until the sheet is full.
+  for (let pass = 0; pass < 64; pass++) {
+    let grew = 0;
+    const snapshot = new Uint8ClampedArray(data);
+    const nextValid = valid.slice();
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = y * size + x;
+        if (valid[i]) continue;
+        let r = 0,
+          g = 0,
+          b = 0,
+          n = 0;
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const xx = x + dx;
+            const yy = y + dy;
+            if (xx < 0 || yy < 0 || xx >= size || yy >= size) continue;
+            const j = yy * size + xx;
+            if (!valid[j]) continue;
+            const o = j * 4;
+            r += snapshot[o];
+            g += snapshot[o + 1];
+            b += snapshot[o + 2];
+            n++;
           }
         }
-        if (best >= 40) {
-          next[i] = br;
-          next[i + 1] = bg;
-          next[i + 2] = bb;
-          next[i + 3] = 255;
+        const o = i * 4;
+        if (n > 0) {
+          data[o] = r / n;
+          data[o + 1] = g / n;
+          data[o + 2] = b / n;
+          data[o + 3] = 255;
+          nextValid[i] = 1;
+          grew++;
+        } else if (pass > 8) {
+          data[o] = meanR;
+          data[o + 1] = meanG;
+          data[o + 2] = meanB;
+          data[o + 3] = 255;
+          nextValid[i] = 1;
+          grew++;
         }
       }
     }
-    cur = next;
+    valid.set(nextValid);
+    if (!grew) break;
   }
 
-  for (let i = 0; i < cur.length; i += 4) {
-    if (cur[i] + cur[i + 1] + cur[i + 2] < 40) {
-      cur[i] = mean[0];
-      cur[i + 1] = mean[1];
-      cur[i + 2] = mean[2];
-      cur[i + 3] = 255;
+  ctx.putImageData(image, 0, 0);
+
+  // Rebuild a denser coat by tiling the content-rich crop 2×2.
+  const coat = document.createElement('canvas');
+  coat.width = coat.height = size;
+  const cctx = coat.getContext('2d')!;
+  const pad = 8;
+  const sx = Math.max(0, minX - pad);
+  const sy = Math.max(0, minY - pad);
+  const sw = Math.max(32, Math.min(size - sx, maxX - minX + pad * 2));
+  const sh = Math.max(32, Math.min(size - sy, maxY - minY + pad * 2));
+  for (let ty = 0; ty < 2; ty++) {
+    for (let tx = 0; tx < 2; tx++) {
+      cctx.drawImage(
+        canvas,
+        sx,
+        sy,
+        sw,
+        sh,
+        (tx * size) / 2,
+        (ty * size) / 2,
+        size / 2,
+        size / 2,
+      );
     }
-    // Push chroma for a more absurd borrowed look.
-    const y = 0.299 * cur[i] + 0.587 * cur[i + 1] + 0.114 * cur[i + 2];
-    cur[i] = Math.min(255, y + (cur[i] - y) * 1.55);
-    cur[i + 1] = Math.min(255, y + (cur[i + 1] - y) * 1.55);
-    cur[i + 2] = Math.min(255, y + (cur[i + 2] - y) * 1.55);
   }
+  // Soft blend seams
+  cctx.globalAlpha = 0.35;
+  cctx.drawImage(canvas, 0, 0, size, size);
+  cctx.globalAlpha = 1;
 
-  img.data.set(cur);
-  ctx.putImageData(img, 0, 0);
-  const texture = new THREE.CanvasTexture(canvas);
+  const texture = new THREE.CanvasTexture(coat);
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
   texture.anisotropy = 8;
@@ -92,30 +153,17 @@ function densifyAtlas(source: CanvasImageSource): THREE.CanvasTexture {
   return texture;
 }
 
-function loadDensifiedTexture(url: string) {
-  return new Promise<THREE.CanvasTexture>((resolve, reject) => {
-    const image = new Image();
-    image.crossOrigin = 'anonymous';
-    image.onload = () => resolve(densifyAtlas(image));
-    image.onerror = () => reject(new Error('texture load failed'));
-    image.src = url;
-  });
-}
-
-/**
- * Dense, warped triplanar coat — full coverage, deliberately uncanny.
- */
-function makeAbsurdSkinMaterial(map: THREE.Texture) {
+function makeBorrowedSkinMaterial(map: THREE.Texture) {
   const material = new THREE.MeshStandardMaterial({
     map,
-    roughness: 0.55,
-    metalness: 0.05,
+    roughness: 0.62,
+    metalness: 0,
   });
 
   material.onBeforeCompile = (shader) => {
-    shader.uniforms.uTime = { value: 0 };
-    material.userData.uTime = shader.uniforms.uTime;
-
+    // Dual scale: broad color fields + finer skin grain for fuller coverage.
+    shader.uniforms.uTriScaleA = { value: 0.42 };
+    shader.uniforms.uTriScaleB = { value: 1.15 };
     shader.vertexShader = shader.vertexShader
       .replace(
         '#include <common>',
@@ -136,59 +184,38 @@ vTriNormal = normalize(normal);`,
         `#include <common>
 varying vec3 vTriPos;
 varying vec3 vTriNormal;
-uniform float uTime;
+uniform float uTriScaleA;
+uniform float uTriScaleB;
 
-float hash21(vec2 p) {
-  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
-}
-
-vec4 sampleTri(sampler2D tex, vec3 pos, vec3 nor, vec3 axisScale, float twist) {
+vec4 sampleTriplanar(sampler2D tex, vec3 pos, vec3 nor, float scale) {
   vec3 blend = abs(normalize(nor));
-  blend = pow(max(blend, vec3(0.0001)), vec3(1.6));
+  blend = pow(max(blend, vec3(0.0001)), vec3(3.0));
   blend /= dot(blend, vec3(1.0));
-
-  vec3 p = pos;
-  float a = twist + uTime * 0.15;
-  float c = cos(a), s = sin(a);
-  p.xz = mat2(c, -s, s, c) * p.xz;
-  p += 0.12 * sin(p.yzx * 2.4 + uTime * 0.35);
-
-  vec2 ux = p.zy * axisScale.x + vec2(0.13, 0.07);
-  vec2 uy = p.xz * axisScale.y + vec2(-0.09, 0.21);
-  vec2 uz = p.xy * axisScale.z + vec2(0.17, -0.11);
-
-  vec4 cx = texture2D(tex, ux);
-  vec4 cy = texture2D(tex, uy);
-  vec4 cz = texture2D(tex, uz);
+  vec4 cx = texture2D(tex, pos.zy * scale + 0.5);
+  vec4 cy = texture2D(tex, pos.xz * scale + 0.5);
+  vec4 cz = texture2D(tex, pos.xy * scale + 0.5);
   return cx * blend.x + cy * blend.y + cz * blend.z;
 }`,
       )
       .replace(
         '#include <map_fragment>',
         `#ifdef USE_MAP
-  // Layered coats at different densities = fuller, stranger coverage.
-  vec4 coatA = sampleTri(map, vTriPos, vTriNormal, vec3(1.15, 0.95, 1.35), 0.4);
-  vec4 coatB = sampleTri(map, vTriPos * 1.7, vTriNormal, vec3(2.4, 2.1, 2.8), -0.9);
-  vec4 coatC = sampleTri(map, vTriPos.zyx * 0.8, -vTriNormal, vec3(0.7, 1.1, 0.85), 1.3);
-  float wiggle = 0.35 + 0.25 * hash21(vTriPos.xy * 3.0 + uTime);
+  vec4 coatA = sampleTriplanar(map, vTriPos, vTriNormal, uTriScaleA);
+  vec4 coatB = sampleTriplanar(map, vTriPos, vTriNormal, uTriScaleB);
   vec4 sampledDiffuseColor = mix(coatA, coatB, 0.45);
-  sampledDiffuseColor = mix(sampledDiffuseColor, coatC, wiggle * 0.4);
-
-  // Crush blacks, punch saturation for an absurd borrowed-skin look.
-  sampledDiffuseColor.rgb = max(sampledDiffuseColor.rgb, vec3(0.04));
-  float luma = dot(sampledDiffuseColor.rgb, vec3(0.299, 0.587, 0.114));
-  sampledDiffuseColor.rgb = clamp(
-    luma + (sampledDiffuseColor.rgb - luma) * 1.7,
-    0.0,
-    1.0
+  // Keep the coat saturated and opaque across the whole body.
+  sampledDiffuseColor.rgb = mix(
+    sampledDiffuseColor.rgb,
+    sampledDiffuseColor.rgb * 1.08 + 0.02,
+    0.25
   );
-  sampledDiffuseColor.rgb = pow(sampledDiffuseColor.rgb, vec3(0.9));
+  sampledDiffuseColor.a = 1.0;
   diffuseColor *= sampledDiffuseColor;
 #endif`,
       );
   };
 
-  material.customProgramCacheKey = () => 'absurd-full-coat-v2';
+  material.customProgramCacheKey = () => 'borrowed-coat-dual-triplanar-v2';
   return material;
 }
 
@@ -224,7 +251,7 @@ export default function ModelViewer({
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.18;
+    renderer.toneMappingExposure = 1.12;
     el.appendChild(renderer.domElement);
 
     const group = new THREE.Group();
@@ -236,37 +263,33 @@ export default function ModelViewer({
     new GLTFLoader().load(
       modelUrl,
       (gltf) => {
-        const model = gltf.scene;
-        fitModel(model);
-
-        const apply = (material?: THREE.Material) => {
+        void (async () => {
           if (cancelled) return;
-          if (material) {
-            model.traverse((node) => {
-              const mesh = node as THREE.Mesh;
-              if (!mesh.isMesh) return;
-              mesh.material = material;
-            });
-          }
-          group.add(model);
-        };
+          const model = gltf.scene;
+          fitModel(model);
 
-        if (textureOverride) {
-          void loadDensifiedTexture(textureOverride)
-            .then((tex) => {
+          if (textureOverride) {
+            try {
+              const coat = await atlasToCoatTexture(textureOverride);
               if (cancelled) {
-                tex.dispose();
+                coat.dispose();
                 return;
               }
-              disposables.push(tex);
-              const material = makeAbsurdSkinMaterial(tex);
+              disposables.push(coat);
+              const material = makeBorrowedSkinMaterial(coat);
               disposables.push(material);
-              apply(material);
-            })
-            .catch(() => apply());
-        } else {
-          apply();
-        }
+              model.traverse((node) => {
+                const mesh = node as THREE.Mesh;
+                if (!mesh.isMesh) return;
+                mesh.material = material;
+              });
+            } catch {
+              el.dataset.error = 'true';
+            }
+          }
+
+          if (!cancelled) group.add(model);
+        })();
       },
       undefined,
       () => {
@@ -324,7 +347,6 @@ export default function ModelViewer({
     const ro = new ResizeObserver(resize);
     ro.observe(el);
 
-    const clock = new THREE.Clock();
     let frame = 0;
     const tick = () => {
       if (!down) {
@@ -332,12 +354,6 @@ export default function ModelViewer({
         vy *= 0.94;
         group.rotation.y += 0.003 + vx;
         group.rotation.x += vy;
-      }
-      const t = clock.getElapsedTime();
-      for (const item of disposables) {
-        if (item instanceof THREE.Material && item.userData.uTime) {
-          item.userData.uTime.value = t;
-        }
       }
       renderer.render(scene, camera);
       frame = requestAnimationFrame(tick);
@@ -364,7 +380,7 @@ export default function ModelViewer({
       aria-label={`${label} uploaded 3D model`}
     >
       <span className="mesh-badge">
-        {textureOverride ? 'ABSURD FULL COAT' : 'GLB + UV'}
+        {textureOverride ? 'FULL SKIN COAT' : 'GLB + UV'}
       </span>
       <span className="orbit-hint">drag to orbit</span>
       <span className="axis">X&nbsp;&nbsp;Y&nbsp;&nbsp;Z</span>
