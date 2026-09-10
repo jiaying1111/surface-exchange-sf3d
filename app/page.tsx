@@ -36,20 +36,68 @@ const fileData = (file: File) =>
     r.readAsDataURL(file);
   });
 
+/** Shrink photos before SF3D so tunnel / Worker uploads stay reliable. */
+async function prepareImage(dataUrl: string, maxSide = 1024) {
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Could not read the uploaded photo.'));
+    img.src = dataUrl;
+  });
+  const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * scale));
+  const height = Math.max(1, Math.round(image.height * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return dataUrl;
+  ctx.drawImage(image, 0, 0, width, height);
+  return canvas.toDataURL('image/jpeg', 0.9);
+}
+
+function explainFailure(error: unknown) {
+  const raw = error instanceof Error ? error.message : String(error || '');
+  if (/load failed|failed to fetch|networkerror|bad gateway|502/i.test(raw)) {
+    return 'Network failed while talking to Stable Fast 3D. Open http://localhost:3000 (not the tunnel URL), then try again with a valid Hugging Face token.';
+  }
+  return raw || 'Stable Fast 3D generation failed';
+}
+
 async function generateOne(image: string, token: string) {
-  const r = await fetch('/api/sf3d', {
+  let response: Response;
+  try {
+    response = await fetch('/api/sf3d', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-hf-token': token },
-      body: JSON.stringify({ image }),
-    }),
-    d = await r.json();
-  if (!r.ok) throw new Error(d.error || 'Stable Fast 3D generation failed');
-  const binary = await fetch(d.modelUrl).then((response) => {
-    if (!response.ok) throw new Error('Could not download the generated GLB.');
-    return response.blob();
+      body: JSON.stringify({ image: await prepareImage(image) }),
+    });
+  } catch (error) {
+    throw new Error(explainFailure(error));
+  }
+
+  const text = await response.text();
+  let data: { error?: string; modelUrl?: string } = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(
+      response.ok
+        ? 'Stable Fast 3D returned an unreadable response.'
+        : explainFailure(new Error(`HTTP ${response.status}: ${text.slice(0, 80)}`)),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(explainFailure(new Error(data.error || `HTTP ${response.status}`)));
+  }
+  if (!data.modelUrl) throw new Error('Stable Fast 3D returned no model URL.');
+
+  const binary = await fetch(data.modelUrl).then((res) => {
+    if (!res.ok) throw new Error('Could not download the generated GLB.');
+    return res.blob();
   });
   return {
-    url: d.modelUrl as string,
+    url: data.modelUrl,
     file: new File([binary], 'stable-fast-3d.glb', {
       type: 'model/gltf-binary',
     }),
@@ -228,7 +276,7 @@ export default function Home() {
       setB({ ...b, modelUrl: modelB.url, modelFile: modelB.file });
       setPhase('ready');
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Generation failed');
+      setError(explainFailure(e));
       setPhase('idle');
     }
   };
@@ -466,7 +514,7 @@ export default function Home() {
                 ? 'The two UV atlases are now independent, persistent surfaces.'
                 : generated
                   ? 'Detach both surfaces before they can travel.'
-                  : 'Add two isolated photos. Generate asks for your token only at that moment.'}
+                  : 'Add two isolated photos. Prefer http://localhost:3000 for generation — the public tunnel often drops the HF request.'}
           </p>
           {error && (
             <div className="api-error">

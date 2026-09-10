@@ -61,7 +61,9 @@ export async function POST(request: NextRequest) {
       ? 'Free GPU quota is exhausted. Use a Hugging Face Pro token or try again after the quota resets.'
       : raw === 'An error occurred'
         ? 'The free SF3D GPU is temporarily unavailable. Please wait a minute and try again.'
-        : raw || 'Stable Fast 3D generation failed.';
+        : /load failed|failed to fetch|networkerror/i.test(raw)
+          ? 'Could not reach Hugging Face Stable Fast 3D from the server. Check the token and try again from http://localhost:3000.'
+          : raw || 'Stable Fast 3D generation failed.';
     return NextResponse.json({ error: message }, { status: 502 });
   }
 }
