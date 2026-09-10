@@ -2,63 +2,39 @@ import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
-const BAKE_SIZE = 1024;
+const PEEL_WIDTH = 2048;
+const PEEL_HEIGHT = 1024;
 
-const bakeVertexShader = /* glsl */ `
+const peelBakeVert = /* glsl */ `
 attribute vec3 aObjPos;
-attribute vec3 aObjNormal;
-varying vec3 vObjPos;
-varying vec3 vObjNormal;
+attribute vec2 aSkinUv;
+uniform float uYMin;
+uniform float uYMax;
+varying vec2 vSkinUv;
 
 void main() {
-  vObjPos = aObjPos;
-  vObjNormal = normalize(aObjNormal);
-  // Flatten the mesh into UV space for atlas baking.
-  vec2 uvNdc = uv * 2.0 - 1.0;
-  gl_Position = vec4(uvNdc, 0.0, 1.0);
+  vSkinUv = aSkinUv;
+  float u = atan(aObjPos.x, aObjPos.z) / (2.0 * 3.14159265) + 0.5;
+  float v = clamp((aObjPos.y - uYMin) / max(uYMax - uYMin, 1e-5), 0.0, 1.0);
+  gl_Position = vec4(u * 2.0 - 1.0, v * 2.0 - 1.0, 0.0, 1.0);
 }
 `;
 
-const bakeFragmentShader = /* glsl */ `
+const peelBakeFrag = /* glsl */ `
 precision highp float;
-uniform sampler2D uSource;
-uniform float uTriScale;
-varying vec3 vObjPos;
-varying vec3 vObjNormal;
-
-vec4 sampleTriplanar(sampler2D tex, vec3 pos, vec3 nor) {
-  vec3 blend = abs(normalize(nor));
-  blend = pow(max(blend, vec3(0.0001)), vec3(4.0));
-  blend /= dot(blend, vec3(1.0));
-  vec4 cx = texture2D(tex, pos.zy * uTriScale + 0.5);
-  vec4 cy = texture2D(tex, pos.xz * uTriScale + 0.5);
-  vec4 cz = texture2D(tex, pos.xy * uTriScale + 0.5);
-  return cx * blend.x + cy * blend.y + cz * blend.z;
-}
+uniform sampler2D uMap;
+uniform vec3 uColor;
+uniform float uHasMap;
+varying vec2 vSkinUv;
 
 void main() {
-  vec4 color = sampleTriplanar(uSource, vObjPos, vObjNormal);
-  float luma = dot(color.rgb, vec3(0.299, 0.587, 0.114));
-  // Fill atlas packing voids so the baked map reads as a continuous coat.
-  if (luma < 0.05) {
-    color.rgb = vec3(0.55, 0.12, 0.1);
+  vec3 color = uColor;
+  if (uHasMap > 0.5) {
+    color *= texture2D(uMap, vSkinUv).rgb;
   }
-  gl_FragColor = vec4(color.rgb, 1.0);
+  gl_FragColor = vec4(color, 1.0);
 }
 `;
-
-function ensureUVs(geometry: THREE.BufferGeometry) {
-  if (geometry.getAttribute('uv')) return;
-  const pos = geometry.getAttribute('position');
-  const uvs = new Float32Array(pos.count * 2);
-  const v = new THREE.Vector3();
-  for (let i = 0; i < pos.count; i++) {
-    v.fromBufferAttribute(pos, i).normalize();
-    uvs[i * 2] = 0.5 + Math.atan2(v.z, v.x) / (Math.PI * 2);
-    uvs[i * 2 + 1] = 0.5 - Math.asin(THREE.MathUtils.clamp(v.y, -1, 1)) / Math.PI;
-  }
-  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-}
 
 function fitModel(model: THREE.Object3D) {
   const box = new THREE.Box3().setFromObject(model);
@@ -71,131 +47,195 @@ function fitModel(model: THREE.Object3D) {
   return span;
 }
 
-/** Bake borrowed albedo into this mesh's own UV atlas (real texture map). */
-function bakeTextureMap(
-  renderer: THREE.WebGLRenderer,
-  mesh: THREE.Mesh,
-  source: THREE.Texture,
-) {
-  const geometry = mesh.geometry.clone();
-  ensureUVs(geometry);
-  if (!geometry.getAttribute('normal')) geometry.computeVertexNormals();
+function worldBounds(root: THREE.Object3D) {
+  const box = new THREE.Box3().setFromObject(root);
+  return {
+    yMin: box.min.y,
+    yMax: box.max.y,
+    radius: Math.max(box.getSize(new THREE.Vector3()).x, box.getSize(new THREE.Vector3()).z, 0.001) * 0.5,
+  };
+}
 
-  // Object-space positions/normals after the parent fit transform.
-  mesh.updateWorldMatrix(true, false);
+function applyCylindricalUVs(geometry: THREE.BufferGeometry, yMin: number, yMax: number) {
   const pos = geometry.getAttribute('position');
-  const nor = geometry.getAttribute('normal');
-  const objPos = new Float32Array(pos.count * 3);
-  const objNor = new Float32Array(pos.count * 3);
+  const uvs = new Float32Array(pos.count * 2);
   const p = new THREE.Vector3();
-  const n = new THREE.Vector3();
-  const normalMatrix = new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld);
-
+  const range = Math.max(yMax - yMin, 1e-5);
   for (let i = 0; i < pos.count; i++) {
-    p.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
-    n.fromBufferAttribute(nor, i).applyMatrix3(normalMatrix).normalize();
-    objPos[i * 3] = p.x;
-    objPos[i * 3 + 1] = p.y;
-    objPos[i * 3 + 2] = p.z;
-    objNor[i * 3] = n.x;
-    objNor[i * 3 + 1] = n.y;
-    objNor[i * 3 + 2] = n.z;
+    p.fromBufferAttribute(pos, i);
+    uvs[i * 2] = Math.atan2(p.x, p.z) / (Math.PI * 2) + 0.5;
+    uvs[i * 2 + 1] = THREE.MathUtils.clamp((p.y - yMin) / range, 0, 1);
   }
+  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+}
 
-  geometry.setAttribute('aObjPos', new THREE.BufferAttribute(objPos, 3));
-  geometry.setAttribute('aObjNormal', new THREE.BufferAttribute(objNor, 3));
+/**
+ * Bake the source body's original textured look into one continuous
+ * cylindrical "peel" image — like unwrapping a single apple skin sheet.
+ */
+function bakeContinuousPeel(
+  renderer: THREE.WebGLRenderer,
+  sourceRoot: THREE.Object3D,
+) {
+  const { yMin, yMax } = worldBounds(sourceRoot);
+  const scene = new THREE.Scene();
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const disposables: Array<THREE.BufferGeometry | THREE.Material> = [];
 
-  source.colorSpace = THREE.SRGBColorSpace;
-  source.wrapS = source.wrapT = THREE.RepeatWrapping;
-  source.needsUpdate = true;
+  sourceRoot.updateMatrixWorld(true);
+  sourceRoot.traverse((node) => {
+    const mesh = node as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.geometry) return;
 
-  const material = new THREE.ShaderMaterial({
-    uniforms: {
-      uSource: { value: source },
-      uTriScale: { value: 0.55 },
-    },
-    vertexShader: bakeVertexShader,
-    fragmentShader: bakeFragmentShader,
-    side: THREE.DoubleSide,
+    const srcGeo = mesh.geometry;
+    const posAttr = srcGeo.getAttribute('position');
+    const uvAttr = srcGeo.getAttribute('uv');
+    if (!posAttr) return;
+
+    const geo = new THREE.BufferGeometry();
+    const objPos = new Float32Array(posAttr.count * 3);
+    const skinUv = new Float32Array(posAttr.count * 2);
+    const p = new THREE.Vector3();
+
+    for (let i = 0; i < posAttr.count; i++) {
+      p.fromBufferAttribute(posAttr, i).applyMatrix4(mesh.matrixWorld);
+      objPos[i * 3] = p.x;
+      objPos[i * 3 + 1] = p.y;
+      objPos[i * 3 + 2] = p.z;
+      if (uvAttr) {
+        skinUv[i * 2] = uvAttr.getX(i);
+        skinUv[i * 2 + 1] = uvAttr.getY(i);
+      } else {
+        skinUv[i * 2] = 0.5;
+        skinUv[i * 2 + 1] = 0.5;
+      }
+    }
+
+    geo.setAttribute('aObjPos', new THREE.BufferAttribute(objPos, 3));
+    geo.setAttribute('aSkinUv', new THREE.BufferAttribute(skinUv, 2));
+    // Dummy position so Three is happy; clip space comes from aObjPos in the shader.
+    geo.setAttribute('position', new THREE.BufferAttribute(objPos, 3));
+    if (srcGeo.index) geo.setIndex(srcGeo.index.clone());
+
+    const matIn = (
+      Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
+    ) as THREE.MeshStandardMaterial;
+    const map = matIn?.map ?? null;
+    const color = matIn?.color ? matIn.color.clone() : new THREE.Color(0xffffff);
+    if (map) {
+      map.colorSpace = THREE.SRGBColorSpace;
+      map.needsUpdate = true;
+    }
+
+    const material = new THREE.ShaderMaterial({
+      uniforms: {
+        uMap: { value: map },
+        uColor: { value: color },
+        uHasMap: { value: map ? 1 : 0 },
+        uYMin: { value: yMin },
+        uYMax: { value: yMax },
+      },
+      vertexShader: peelBakeVert,
+      fragmentShader: peelBakeFrag,
+      side: THREE.DoubleSide,
+      depthTest: false,
+      depthWrite: false,
+    });
+
+    disposables.push(geo, material);
+    scene.add(new THREE.Mesh(geo, material));
   });
 
-  const bakeMesh = new THREE.Mesh(geometry, material);
-  const scene = new THREE.Scene();
-  scene.add(bakeMesh);
-  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-
-  const target = new THREE.WebGLRenderTarget(BAKE_SIZE, BAKE_SIZE, {
+  const target = new THREE.WebGLRenderTarget(PEEL_WIDTH, PEEL_HEIGHT, {
     type: THREE.UnsignedByteType,
     format: THREE.RGBAFormat,
     colorSpace: THREE.SRGBColorSpace,
   });
 
-  const prevTarget = renderer.getRenderTarget();
-  const prevClear = new THREE.Color();
-  renderer.getClearColor(prevClear);
+  const prev = renderer.getRenderTarget();
+  const prevColor = new THREE.Color();
+  renderer.getClearColor(prevColor);
   const prevAlpha = renderer.getClearAlpha();
-  const prevAutoClear = renderer.autoClear;
 
   renderer.setRenderTarget(target);
-  renderer.setClearColor(0x1a0a08, 1);
-  renderer.autoClear = true;
+  renderer.setClearColor(0x6b1d14, 1);
   renderer.clear();
   renderer.render(scene, camera);
+  renderer.setRenderTarget(prev);
+  renderer.setClearColor(prevColor, prevAlpha);
 
-  renderer.setRenderTarget(prevTarget);
-  renderer.setClearColor(prevClear, prevAlpha);
-  renderer.autoClear = prevAutoClear;
-
-  material.dispose();
-  geometry.dispose();
+  for (const item of disposables) item.dispose();
 
   const map = target.texture;
   map.colorSpace = THREE.SRGBColorSpace;
-  map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
+  map.wrapS = THREE.RepeatWrapping;
+  map.wrapT = THREE.ClampToEdgeWrapping;
   map.flipY = false;
   map.needsUpdate = true;
-  return { map, target };
+  return { map, target, yMin, yMax };
 }
 
-function applyBakedMaps(
-  renderer: THREE.WebGLRenderer,
-  model: THREE.Object3D,
-  source: THREE.Texture,
+function wrapWithPeel(
+  root: THREE.Object3D,
+  peel: THREE.Texture,
+  yMin: number,
+  yMax: number,
 ) {
   const materials: THREE.Material[] = [];
-  const targets: THREE.WebGLRenderTarget[] = [];
+  root.updateMatrixWorld(true);
 
-  model.traverse((node) => {
+  root.traverse((node) => {
     const mesh = node as THREE.Mesh;
     if (!mesh.isMesh || !mesh.geometry) return;
-    const { map, target } = bakeTextureMap(renderer, mesh, source);
-    targets.push(target);
+
+    // Build world-space positions into a bake-friendly local copy for UV gen.
+    const geo = mesh.geometry;
+    const pos = geo.getAttribute('position');
+    const world = new Float32Array(pos.count * 3);
+    const p = new THREE.Vector3();
+    for (let i = 0; i < pos.count; i++) {
+      p.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
+      world[i * 3] = p.x;
+      world[i * 3 + 1] = p.y;
+      world[i * 3 + 2] = p.z;
+    }
+    const tmp = new THREE.BufferGeometry();
+    tmp.setAttribute('position', new THREE.BufferAttribute(world, 3));
+    applyCylindricalUVs(tmp, yMin, yMax);
+    geo.setAttribute('uv', tmp.getAttribute('uv'));
+
     const material = new THREE.MeshStandardMaterial({
-      map,
-      roughness: 0.7,
+      map: peel,
+      roughness: 0.72,
       metalness: 0,
     });
     materials.push(material);
     mesh.material = material;
   });
 
-  return { materials, targets };
+  return materials;
 }
 
-function loadTexture(url: string) {
-  return new Promise<THREE.Texture>((resolve, reject) => {
-    new THREE.TextureLoader().load(url, resolve, undefined, reject);
+function loadGltf(url: string) {
+  return new Promise<THREE.Group>((resolve, reject) => {
+    new GLTFLoader().load(
+      url,
+      (gltf) => resolve(gltf.scene),
+      undefined,
+      reject,
+    );
   });
 }
 
 export default function ModelViewer({
   modelUrl,
   label,
-  textureOverride,
+  borrowFromUrl,
 }: {
   modelUrl: string;
   label: string;
-  textureOverride?: string;
+  /** Other body's GLB — its original textured look becomes one continuous peel map. */
+  borrowFromUrl?: string;
 }) {
   const host = useRef<HTMLDivElement>(null);
 
@@ -220,33 +260,30 @@ export default function ModelViewer({
     const targets: THREE.WebGLRenderTarget[] = [];
     let cancelled = false;
 
-    new GLTFLoader().load(
-      modelUrl,
-      async (gltf) => {
+    (async () => {
+      try {
+        const model = await loadGltf(modelUrl);
         if (cancelled) return;
-        const model = gltf.scene;
         fitModel(model);
 
-        if (textureOverride) {
-          try {
-            const source = await loadTexture(textureOverride);
-            if (cancelled) return;
-            const baked = applyBakedMaps(renderer, model, source);
-            materials.push(...baked.materials);
-            targets.push(...baked.targets);
-            source.dispose();
-          } catch {
-            el.dataset.error = 'true';
-          }
+        if (borrowFromUrl) {
+          const source = await loadGltf(borrowFromUrl);
+          if (cancelled) return;
+          fitModel(source);
+          const peel = bakeContinuousPeel(renderer, source);
+          targets.push(peel.target);
+          // Match peel vertical framing to the wearing body.
+          const body = worldBounds(model);
+          materials.push(
+            ...wrapWithPeel(model, peel.map, body.yMin, body.yMax),
+          );
         }
 
         if (!cancelled) group.add(model);
-      },
-      undefined,
-      () => {
+      } catch {
         el.dataset.error = 'true';
-      },
-    );
+      }
+    })();
 
     scene.add(new THREE.HemisphereLight(0xffffff, 0x242638, 2.7));
     const key = new THREE.DirectionalLight(0xffffff, 3.1);
@@ -323,7 +360,7 @@ export default function ModelViewer({
       renderer.dispose();
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement);
     };
-  }, [modelUrl, textureOverride]);
+  }, [modelUrl, borrowFromUrl]);
 
   return (
     <div
@@ -332,7 +369,7 @@ export default function ModelViewer({
       aria-label={`${label} uploaded 3D model`}
     >
       <span className="mesh-badge">
-        {textureOverride ? 'BAKED TEXTURE MAP' : 'GLB + UV'}
+        {borrowFromUrl ? 'CONTINUOUS PEEL MAP' : 'GLB + UV'}
       </span>
       <span className="orbit-hint">drag to orbit</span>
       <span className="axis">X&nbsp;&nbsp;Y&nbsp;&nbsp;Z</span>
