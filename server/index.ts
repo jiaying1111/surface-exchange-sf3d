@@ -5,7 +5,7 @@ import cors from 'cors';
 import express from 'express';
 import multer from 'multer';
 import { getGalleryFile, listGallery, saveGallery } from './gallery';
-import { generateSf3d, getSf3dJob } from './sf3d';
+import { checkToken, generateSf3d, getSf3dJob } from './sf3d';
 import { dataRoot, distDir, ensureStorage, temporaryDir } from './storage';
 
 function loadEnv() {
@@ -45,6 +45,7 @@ app.get('/api/health', (_req, res) => {
 
 app.post('/api/sf3d', upload.single('image'), generateSf3d);
 app.get('/api/sf3d/:id', getSf3dJob);
+app.post('/api/hf/whoami', express.json({ limit: '32kb' }), checkToken);
 
 app.get('/api/generated/:id', async (req, res) => {
   const id = String(req.params.id || '');

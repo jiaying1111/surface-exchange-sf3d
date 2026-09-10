@@ -66,8 +66,14 @@ async function generateOne(image: string, token: string) {
   try {
     response = await fetch('/api/sf3d', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-hf-token': token },
-      body: JSON.stringify({ image: await prepareImage(image) }),
+      headers: {
+        'Content-Type': 'application/json',
+        'x-hf-token': token.trim(),
+      },
+      body: JSON.stringify({
+        image: await prepareImage(image),
+        token: token.trim(),
+      }),
     });
   } catch (error) {
     throw new Error(explainFailure(error));
@@ -235,7 +241,10 @@ function TokenPrompt({
             onContinue(input.current.value.trim());
         }}
       />
-      <small>USED ONLY FOR THIS GENERATION. NEVER SAVED.</small>
+      <small>
+        USE A USER ACCESS TOKEN FROM YOUR PRO ACCOUNT. ZEROGPU STILL HAS A DAILY
+        QUOTA.
+      </small>
       <div>
         <button onClick={onCancel}>CANCEL</button>
         <button
@@ -284,6 +293,7 @@ export default function Home() {
 
   const generate = async (token: string) => {
     if (!a || !b) return;
+    const cleaned = token.trim();
     setShowToken(false);
     setError('');
     setPhase('geometry');
@@ -291,15 +301,24 @@ export default function Home() {
     setAtlases({});
     setProgress([8, 8]);
     try {
-      const pa = generateOne(a.data, token).then((model) => {
-          setProgress((p) => [100, p[1]]);
-          return model;
-        }),
-        pb = generateOne(b.data, token).then((model) => {
-          setProgress((p) => [p[0], 100]);
-          return model;
-        }),
-        [modelA, modelB] = await Promise.all([pa, pb]);
+      const who = await fetch('/api/hf/whoami', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-hf-token': cleaned,
+        },
+        body: JSON.stringify({ token: cleaned }),
+      });
+      const whoData = await who.json();
+      if (!who.ok) {
+        throw new Error(whoData.error || 'Hugging Face token was rejected.');
+      }
+
+      // Sequential: parallel ZeroGPU calls burn quota/runs twice as fast.
+      const modelA = await generateOne(a.data, cleaned);
+      setProgress((p) => [100, p[1]]);
+      const modelB = await generateOne(b.data, cleaned);
+      setProgress((p) => [p[0], 100]);
       setA({ ...a, modelUrl: modelA.url, modelFile: modelA.file });
       setB({ ...b, modelUrl: modelB.url, modelFile: modelB.file });
       setPhase('ready');
