@@ -141,13 +141,13 @@ async function generateOne(image: string, token: string) {
 function Slot({
   label,
   obj,
-  skinAtlasUrl,
+  texture,
   onPick,
   onClear,
 }: {
   label: string;
   obj: Obj | null;
-  skinAtlasUrl?: string;
+  texture?: string;
   onPick: (f: File) => void;
   onClear: () => void;
 }) {
@@ -177,7 +177,7 @@ function Slot({
           <ModelViewer
             modelUrl={obj.modelUrl}
             label={label}
-            skinAtlasUrl={skinAtlasUrl}
+            textureOverride={texture}
           />
         ) : (
           <div className="source-preview">
@@ -432,7 +432,7 @@ export default function Home() {
       <div className="intro three-intro">
         <div>
           <span className="kicker">
-            IMAGE → SF3D MESH → FULL SKIN MAP → WRAP
+            IMAGE → SF3D MESH → DETACH MAPS → SWAP
           </span>
           <h1>
             Two real bodies.
@@ -472,7 +472,7 @@ export default function Home() {
         <Slot
           label="OBJECT A"
           obj={a}
-          skinAtlasUrl={swapped ? atlases.b : undefined}
+          texture={swapped ? atlases.b : undefined}
           onPick={(f) => pick('a', f)}
           onClear={() => {
             setA(null);
@@ -558,9 +558,9 @@ export default function Home() {
             {busy
               ? 'The free GPU may queue. Keep this tab open while both bodies form.'
               : detached
-                ? 'Exchange fills each atlas into one solid skin map, then wraps it onto the other body.'
+                ? 'The two albedo maps are detached. Exchange swaps them onto the other body.'
                 : generated
-                  ? 'Detach surfaces, then wrap each body in the other full skin texture.'
+                  ? 'Detach both material maps, then swap them.'
                   : "Add two isolated photos. Generation runs on this app's own Node API via Hugging Face Stable Fast 3D."}
           </p>
           {error && (
@@ -574,7 +574,7 @@ export default function Home() {
         <Slot
           label="OBJECT B"
           obj={b}
-          skinAtlasUrl={swapped ? atlases.a : undefined}
+          texture={swapped ? atlases.a : undefined}
           onPick={(f) => pick('b', f)}
           onClear={() => {
             setB(null);
@@ -599,7 +599,7 @@ export default function Home() {
               ) : archiveState === 'error' ? (
                 'COULD NOT SAVE THIS PAIR'
               ) : (
-                'THE BODIES REMAIN. EACH WEARS ONE FULL SKIN TEXTURE FROM THE OTHER.'
+                'THE BODIES REMAIN. THEIR DETACHED MAPS HAVE CHANGED PLACES.'
               )}
             </small>
           </div>
