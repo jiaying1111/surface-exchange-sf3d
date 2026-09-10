@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: surface-exchange-sf3d
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HF_TOKEN
+        sync: false
+      - key: SF3D_SPACE_ID
+        value: Upsampler/stable-fast-3d
+      - key: SF3D_API_NAME
+        value: /image_to_glb
