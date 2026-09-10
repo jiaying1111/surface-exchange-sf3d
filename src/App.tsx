@@ -141,13 +141,13 @@ async function generateOne(image: string, token: string) {
 function Slot({
   label,
   obj,
-  texture,
+  materialMapUrl,
   onPick,
   onClear,
 }: {
   label: string;
   obj: Obj | null;
-  texture?: string;
+  materialMapUrl?: string;
   onPick: (f: File) => void;
   onClear: () => void;
 }) {
@@ -177,7 +177,7 @@ function Slot({
           <ModelViewer
             modelUrl={obj.modelUrl}
             label={label}
-            textureOverride={texture}
+            materialMapUrl={materialMapUrl}
           />
         ) : (
           <div className="source-preview">
@@ -210,7 +210,7 @@ function Slot({
         <span>{obj?.name || 'NO INPUT'}</span>
         {obj?.modelUrl && (
           <span className="ready">
-            <Check size={13} /> GLB + UV
+            <Check size={13} /> MATERIAL READY
           </span>
         )}
       </div>
@@ -432,7 +432,7 @@ export default function Home() {
       <div className="intro three-intro">
         <div>
           <span className="kicker">
-            IMAGE → SF3D MESH → DETACH MAPS → SWAP
+            IMAGE → SF3D MESH → DETACH MATERIAL → SWAP MAPS
           </span>
           <h1>
             Two real bodies.
@@ -460,9 +460,9 @@ export default function Home() {
           <div className={detached ? 'done' : ''}>
             <b>03</b>
             <span>
-              unwrap
+              detach
               <br />
-              surfaces
+              materials
             </span>
           </div>
         </div>
@@ -472,7 +472,7 @@ export default function Home() {
         <Slot
           label="OBJECT A"
           obj={a}
-          texture={swapped ? atlases.b : undefined}
+          materialMapUrl={swapped ? atlases.b : undefined}
           onPick={(f) => pick('a', f)}
           onClear={() => {
             setA(null);
@@ -499,20 +499,20 @@ export default function Home() {
           ) : detached && a?.modelUrl && b?.modelUrl ? (
             <div className="between-surfaces">
               <div className="between-note">
-                THE SURFACE HAS
+                MATERIALS DETACHED.
                 <br />
-                LEFT THE OBJECT.
+                SWAP THE TWO MAPS.
               </div>
               <TextureAtlas
                 modelUrl={a.modelUrl}
-                label="SURFACE A"
+                label="MATERIAL A"
                 onReady={(atlas) =>
                   setAtlases((current) => ({ ...current, a: atlas }))
                 }
               />
               <TextureAtlas
                 modelUrl={b.modelUrl}
-                label="SURFACE B"
+                label="MATERIAL B"
                 onReady={(atlas) =>
                   setAtlases((current) => ({ ...current, b: atlas }))
                 }
@@ -523,7 +523,7 @@ export default function Home() {
                 onClick={exchange}
               >
                 <ArrowLeftRight size={18} />
-                {mapsReady ? (swapped ? 'RESTORE' : 'EXCHANGE') : 'UNWRAPPING…'}
+                {mapsReady ? (swapped ? 'RESTORE' : 'SWAP MAPS') : 'READING…'}
               </button>
             </div>
           ) : (
@@ -550,7 +550,7 @@ export default function Home() {
                 <Scissors size={16} />
                 DETACH BOTH
                 <br />
-                SURFACES
+                MATERIALS
               </button>
             </>
           )}
@@ -558,9 +558,9 @@ export default function Home() {
             {busy
               ? 'The free GPU may queue. Keep this tab open while both bodies form.'
               : detached
-                ? 'The two albedo maps are detached. Exchange swaps them onto the other body.'
+                ? 'Materials are detached. Swap simply exchanges the two albedo maps.'
                 : generated
-                  ? 'Detach both material maps, then swap them.'
+                  ? 'Detach both materials, then swap their texture maps.'
                   : "Add two isolated photos. Generation runs on this app's own Node API via Hugging Face Stable Fast 3D."}
           </p>
           {error && (
@@ -574,7 +574,7 @@ export default function Home() {
         <Slot
           label="OBJECT B"
           obj={b}
-          texture={swapped ? atlases.a : undefined}
+          materialMapUrl={swapped ? atlases.a : undefined}
           onPick={(f) => pick('b', f)}
           onClear={() => {
             setB(null);
@@ -588,22 +588,22 @@ export default function Home() {
       {swapped && (
         <div className="result-bar">
           <div>
-            <span className="result-dot" /> SURFACE EXCHANGE COMPLETE{' '}
+            <span className="result-dot" /> MATERIAL SWAP COMPLETE{' '}
             <small>
               {archiveState === 'saving' ? (
-                'ARCHIVING MODELS + UV SURFACES…'
+                'ARCHIVING MODELS + MATERIAL MAPS…'
               ) : archiveState === 'saved' ? (
                 <>
-                  <Archive size={13} /> MODELS + UV SURFACES SAVED
+                  <Archive size={13} /> MODELS + MATERIAL MAPS SAVED
                 </>
               ) : archiveState === 'error' ? (
                 'COULD NOT SAVE THIS PAIR'
               ) : (
-                'THE BODIES REMAIN. THEIR DETACHED MAPS HAVE CHANGED PLACES.'
+                'THE BODIES REMAIN. THEIR MATERIAL MAPS HAVE CHANGED PLACES.'
               )}
             </small>
           </div>
-          <button onClick={() => setPhase('ready')}>ORIGINAL SURFACES</button>
+          <button onClick={() => setPhase('ready')}>ORIGINAL MATERIALS</button>
         </div>
       )}
 

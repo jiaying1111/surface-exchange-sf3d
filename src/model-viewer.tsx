@@ -11,15 +11,45 @@ function fitModel(model: THREE.Object3D) {
   model.scale.setScalar(2.8 / span);
 }
 
+function asStandard(
+  source: THREE.Material | THREE.Material[],
+  mapOverride?: THREE.Texture,
+) {
+  const first = (Array.isArray(source) ? source[0] : source) as
+    | THREE.MeshStandardMaterial
+    | THREE.MeshBasicMaterial
+    | undefined;
+  const map =
+    mapOverride ||
+    ('map' in (first || {}) ? (first as THREE.MeshStandardMaterial).map : null);
+  if (map) {
+    map.colorSpace = THREE.SRGBColorSpace;
+    map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
+    map.needsUpdate = true;
+  }
+  return new THREE.MeshStandardMaterial({
+    map: map || null,
+    color: map ? 0xffffff : first && 'color' in first ? first.color : 0xcccccc,
+    roughness: 0.72,
+    metalness: 0,
+  });
+}
+
+function loadTexture(url: string) {
+  return new Promise<THREE.Texture>((resolve, reject) => {
+    new THREE.TextureLoader().load(url, resolve, undefined, reject);
+  });
+}
+
 export default function ModelViewer({
   modelUrl,
   label,
-  textureOverride,
+  materialMapUrl,
 }: {
   modelUrl: string;
   label: string;
-  /** Other object's detached albedo map — swapped onto this mesh as-is. */
-  textureOverride?: string;
+  /** Other object's detached albedo — swapped onto this body as a plain material map. */
+  materialMapUrl?: string;
 }) {
   const host = useRef<HTMLDivElement>(null);
 
@@ -34,7 +64,7 @@ export default function ModelViewer({
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.1;
+    renderer.toneMappingExposure = 1.15;
     el.appendChild(renderer.domElement);
 
     const group = new THREE.Group();
@@ -42,34 +72,38 @@ export default function ModelViewer({
 
     const materials: THREE.Material[] = [];
     const textures: THREE.Texture[] = [];
+    let cancelled = false;
 
     new GLTFLoader().load(
       modelUrl,
-      (gltf) => {
+      async (gltf) => {
+        if (cancelled) return;
         const model = gltf.scene;
         fitModel(model);
 
-        if (textureOverride) {
-          const tex = new THREE.TextureLoader().load(textureOverride);
-          tex.colorSpace = THREE.SRGBColorSpace;
-          tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-          tex.flipY = false;
-          tex.needsUpdate = true;
-          textures.push(tex);
-
-          const material = new THREE.MeshStandardMaterial({
-            map: tex,
-            roughness: 0.72,
-            metalness: 0,
-          });
-          materials.push(material);
-          model.traverse((node) => {
-            const mesh = node as THREE.Mesh;
-            if (mesh.isMesh) mesh.material = material;
-          });
+        let override: THREE.Texture | undefined;
+        if (materialMapUrl) {
+          try {
+            override = await loadTexture(materialMapUrl);
+            if (cancelled) {
+              override.dispose();
+              return;
+            }
+            textures.push(override);
+          } catch {
+            el.dataset.error = 'true';
+          }
         }
 
-        group.add(model);
+        model.traverse((node) => {
+          const mesh = node as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          const material = asStandard(mesh.material, override);
+          materials.push(material);
+          mesh.material = material;
+        });
+
+        if (!cancelled) group.add(model);
       },
       undefined,
       () => {
@@ -77,13 +111,13 @@ export default function ModelViewer({
       },
     );
 
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x242638, 2.7));
-    const key = new THREE.DirectionalLight(0xffffff, 3.1);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x2a2c38, 2.4));
+    const key = new THREE.DirectionalLight(0xffffff, 2.8);
     key.position.set(3, 5, 4);
     scene.add(key);
-    const rim = new THREE.DirectionalLight(0x5366ff, 2);
-    rim.position.set(-4, 1, -3);
-    scene.add(rim);
+    const fill = new THREE.DirectionalLight(0xffffff, 1.2);
+    fill.position.set(-3, 2, -2);
+    scene.add(fill);
 
     const grid = new THREE.GridHelper(5, 14, 0x4b4d4c, 0x292b2b);
     grid.position.y = -1.55;
@@ -141,6 +175,7 @@ export default function ModelViewer({
     tick();
 
     return () => {
+      cancelled = true;
       cancelAnimationFrame(frame);
       ro.disconnect();
       el.removeEventListener('pointerdown', start);
@@ -151,7 +186,7 @@ export default function ModelViewer({
       renderer.dispose();
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement);
     };
-  }, [modelUrl, textureOverride]);
+  }, [modelUrl, materialMapUrl]);
 
   return (
     <div
@@ -160,7 +195,7 @@ export default function ModelViewer({
       aria-label={`${label} uploaded 3D model`}
     >
       <span className="mesh-badge">
-        {textureOverride ? 'SWAPPED MAP' : 'GLB + UV'}
+        {materialMapUrl ? 'SWAPPED MATERIAL' : 'ORIGINAL MATERIAL'}
       </span>
       <span className="orbit-hint">drag to orbit</span>
       <span className="axis">X&nbsp;&nbsp;Y&nbsp;&nbsp;Z</span>
