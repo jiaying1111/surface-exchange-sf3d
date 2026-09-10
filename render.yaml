@@ -3,11 +3,15 @@ services:
     name: surface-exchange-sf3d
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
+    region: oregon
+    buildCommand: npm install --include=dev && npm run build
     startCommand: npm start
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: "22"
       - key: HF_TOKEN
         sync: false
       - key: SF3D_SPACE_ID
