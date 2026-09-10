@@ -2,39 +2,146 @@ import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
-const PEEL_WIDTH = 2048;
-const PEEL_HEIGHT = 1024;
-
-const peelBakeVert = /* glsl */ `
-attribute vec3 aObjPos;
-attribute vec2 aSkinUv;
-uniform float uYMin;
-uniform float uYMax;
-varying vec2 vSkinUv;
-
-void main() {
-  vSkinUv = aSkinUv;
-  float u = atan(aObjPos.x, aObjPos.z) / (2.0 * 3.14159265) + 0.5;
-  float v = clamp((aObjPos.y - uYMin) / max(uYMax - uYMin, 1e-5), 0.0, 1.0);
-  gl_Position = vec4(u * 2.0 - 1.0, v * 2.0 - 1.0, 0.0, 1.0);
+function loadImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
 }
-`;
 
-const peelBakeFrag = /* glsl */ `
-precision highp float;
-uniform sampler2D uMap;
-uniform vec3 uColor;
-uniform float uHasMap;
-varying vec2 vSkinUv;
+/**
+ * Turn a packed UV atlas (charts on black) into one continuous skin sheet
+ * by flooding empty packing pixels with nearby surface colors.
+ */
+async function atlasToContinuousSkin(atlasUrl: string) {
+  const img = await loadImage(atlasUrl);
+  const size = 1024;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, size, size);
+  ctx.drawImage(img, 0, 0, size, size);
 
-void main() {
-  vec3 color = uColor;
-  if (uHasMap > 0.5) {
-    color *= texture2D(uMap, vSkinUv).rgb;
+  const imageData = ctx.getImageData(0, 0, size, size);
+  const { data } = imageData;
+  const empty = new Uint8Array(size * size);
+  for (let i = 0; i < size * size; i++) {
+    const o = i * 4;
+    const luma = 0.299 * data[o] + 0.587 * data[o + 1] + 0.114 * data[o + 2];
+    empty[i] = luma < 22 ? 1 : 0;
   }
-  gl_FragColor = vec4(color, 1.0);
+
+  // Grow surface colors into the black packing until the sheet is solid.
+  for (let iter = 0; iter < 96; iter++) {
+    const nextEmpty = new Uint8Array(empty);
+    const nextData = new Uint8ClampedArray(data);
+    let changed = false;
+    for (let y = 1; y < size - 1; y++) {
+      for (let x = 1; x < size - 1; x++) {
+        const i = y * size + x;
+        if (!empty[i]) continue;
+        let r = 0,
+          g = 0,
+          b = 0,
+          n = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const j = (y + dy) * size + (x + dx);
+            if (empty[j]) continue;
+            const o = j * 4;
+            r += data[o];
+            g += data[o + 1];
+            b += data[o + 2];
+            n++;
+          }
+        }
+        if (!n) continue;
+        const o = i * 4;
+        nextData[o] = r / n;
+        nextData[o + 1] = g / n;
+        nextData[o + 2] = b / n;
+        nextData[o + 3] = 255;
+        nextEmpty[i] = 0;
+        changed = true;
+      }
+    }
+    data.set(nextData);
+    empty.set(nextEmpty);
+    if (!changed) break;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+  // Soft pass so the skin reads as one ordinary continuous map.
+  ctx.filter = 'blur(1.2px)';
+  ctx.drawImage(canvas, 0, 0);
+  ctx.filter = 'none';
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+  texture.anisotropy = 8;
+  texture.needsUpdate = true;
+  return texture;
 }
-`;
+
+function makeTriplanarSkinMaterial(map: THREE.Texture, scale: number) {
+  const material = new THREE.MeshStandardMaterial({
+    map,
+    roughness: 0.7,
+    metalness: 0,
+  });
+
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uTriScale = { value: scale };
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+varying vec3 vSkinPos;
+varying vec3 vSkinNormal;`,
+      )
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+vSkinPos = transformed;
+vSkinNormal = normalize(normal);`,
+      );
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+varying vec3 vSkinPos;
+varying vec3 vSkinNormal;
+uniform float uTriScale;
+
+vec4 sampleSkin(sampler2D tex, vec3 pos, vec3 nor) {
+  vec3 blend = abs(normalize(nor));
+  blend = pow(max(blend, vec3(0.0001)), vec3(3.0));
+  blend /= dot(blend, vec3(1.0));
+  vec4 x = texture2D(tex, pos.zy * uTriScale);
+  vec4 y = texture2D(tex, pos.xz * uTriScale);
+  vec4 z = texture2D(tex, pos.xy * uTriScale);
+  return x * blend.x + y * blend.y + z * blend.z;
+}`,
+      )
+      .replace(
+        '#include <map_fragment>',
+        `#ifdef USE_MAP
+  vec4 sampledDiffuseColor = sampleSkin(map, vSkinPos, vSkinNormal);
+  diffuseColor *= sampledDiffuseColor;
+#endif`,
+      );
+  };
+
+  material.customProgramCacheKey = () => `full-skin-triplanar-${scale.toFixed(3)}`;
+  return material;
+}
 
 function fitModel(model: THREE.Object3D) {
   const box = new THREE.Box3().setFromObject(model);
@@ -44,198 +151,17 @@ function fitModel(model: THREE.Object3D) {
   model.position.sub(center);
   model.scale.setScalar(2.8 / span);
   model.updateMatrixWorld(true);
-  return span;
-}
-
-function worldBounds(root: THREE.Object3D) {
-  const box = new THREE.Box3().setFromObject(root);
-  return {
-    yMin: box.min.y,
-    yMax: box.max.y,
-    radius: Math.max(box.getSize(new THREE.Vector3()).x, box.getSize(new THREE.Vector3()).z, 0.001) * 0.5,
-  };
-}
-
-function applyCylindricalUVs(geometry: THREE.BufferGeometry, yMin: number, yMax: number) {
-  const pos = geometry.getAttribute('position');
-  const uvs = new Float32Array(pos.count * 2);
-  const p = new THREE.Vector3();
-  const range = Math.max(yMax - yMin, 1e-5);
-  for (let i = 0; i < pos.count; i++) {
-    p.fromBufferAttribute(pos, i);
-    uvs[i * 2] = Math.atan2(p.x, p.z) / (Math.PI * 2) + 0.5;
-    uvs[i * 2 + 1] = THREE.MathUtils.clamp((p.y - yMin) / range, 0, 1);
-  }
-  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-}
-
-/**
- * Bake the source body's original textured look into one continuous
- * cylindrical "peel" image — like unwrapping a single apple skin sheet.
- */
-function bakeContinuousPeel(
-  renderer: THREE.WebGLRenderer,
-  sourceRoot: THREE.Object3D,
-) {
-  const { yMin, yMax } = worldBounds(sourceRoot);
-  const scene = new THREE.Scene();
-  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-  const disposables: Array<THREE.BufferGeometry | THREE.Material> = [];
-
-  sourceRoot.updateMatrixWorld(true);
-  sourceRoot.traverse((node) => {
-    const mesh = node as THREE.Mesh;
-    if (!mesh.isMesh || !mesh.geometry) return;
-
-    const srcGeo = mesh.geometry;
-    const posAttr = srcGeo.getAttribute('position');
-    const uvAttr = srcGeo.getAttribute('uv');
-    if (!posAttr) return;
-
-    const geo = new THREE.BufferGeometry();
-    const objPos = new Float32Array(posAttr.count * 3);
-    const skinUv = new Float32Array(posAttr.count * 2);
-    const p = new THREE.Vector3();
-
-    for (let i = 0; i < posAttr.count; i++) {
-      p.fromBufferAttribute(posAttr, i).applyMatrix4(mesh.matrixWorld);
-      objPos[i * 3] = p.x;
-      objPos[i * 3 + 1] = p.y;
-      objPos[i * 3 + 2] = p.z;
-      if (uvAttr) {
-        skinUv[i * 2] = uvAttr.getX(i);
-        skinUv[i * 2 + 1] = uvAttr.getY(i);
-      } else {
-        skinUv[i * 2] = 0.5;
-        skinUv[i * 2 + 1] = 0.5;
-      }
-    }
-
-    geo.setAttribute('aObjPos', new THREE.BufferAttribute(objPos, 3));
-    geo.setAttribute('aSkinUv', new THREE.BufferAttribute(skinUv, 2));
-    // Dummy position so Three is happy; clip space comes from aObjPos in the shader.
-    geo.setAttribute('position', new THREE.BufferAttribute(objPos, 3));
-    if (srcGeo.index) geo.setIndex(srcGeo.index.clone());
-
-    const matIn = (
-      Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
-    ) as THREE.MeshStandardMaterial;
-    const map = matIn?.map ?? null;
-    const color = matIn?.color ? matIn.color.clone() : new THREE.Color(0xffffff);
-    if (map) {
-      map.colorSpace = THREE.SRGBColorSpace;
-      map.needsUpdate = true;
-    }
-
-    const material = new THREE.ShaderMaterial({
-      uniforms: {
-        uMap: { value: map },
-        uColor: { value: color },
-        uHasMap: { value: map ? 1 : 0 },
-        uYMin: { value: yMin },
-        uYMax: { value: yMax },
-      },
-      vertexShader: peelBakeVert,
-      fragmentShader: peelBakeFrag,
-      side: THREE.DoubleSide,
-      depthTest: false,
-      depthWrite: false,
-    });
-
-    disposables.push(geo, material);
-    scene.add(new THREE.Mesh(geo, material));
-  });
-
-  const target = new THREE.WebGLRenderTarget(PEEL_WIDTH, PEEL_HEIGHT, {
-    type: THREE.UnsignedByteType,
-    format: THREE.RGBAFormat,
-    colorSpace: THREE.SRGBColorSpace,
-  });
-
-  const prev = renderer.getRenderTarget();
-  const prevColor = new THREE.Color();
-  renderer.getClearColor(prevColor);
-  const prevAlpha = renderer.getClearAlpha();
-
-  renderer.setRenderTarget(target);
-  renderer.setClearColor(0x6b1d14, 1);
-  renderer.clear();
-  renderer.render(scene, camera);
-  renderer.setRenderTarget(prev);
-  renderer.setClearColor(prevColor, prevAlpha);
-
-  for (const item of disposables) item.dispose();
-
-  const map = target.texture;
-  map.colorSpace = THREE.SRGBColorSpace;
-  map.wrapS = THREE.RepeatWrapping;
-  map.wrapT = THREE.ClampToEdgeWrapping;
-  map.flipY = false;
-  map.needsUpdate = true;
-  return { map, target, yMin, yMax };
-}
-
-function wrapWithPeel(
-  root: THREE.Object3D,
-  peel: THREE.Texture,
-  yMin: number,
-  yMax: number,
-) {
-  const materials: THREE.Material[] = [];
-  root.updateMatrixWorld(true);
-
-  root.traverse((node) => {
-    const mesh = node as THREE.Mesh;
-    if (!mesh.isMesh || !mesh.geometry) return;
-
-    // Build world-space positions into a bake-friendly local copy for UV gen.
-    const geo = mesh.geometry;
-    const pos = geo.getAttribute('position');
-    const world = new Float32Array(pos.count * 3);
-    const p = new THREE.Vector3();
-    for (let i = 0; i < pos.count; i++) {
-      p.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
-      world[i * 3] = p.x;
-      world[i * 3 + 1] = p.y;
-      world[i * 3 + 2] = p.z;
-    }
-    const tmp = new THREE.BufferGeometry();
-    tmp.setAttribute('position', new THREE.BufferAttribute(world, 3));
-    applyCylindricalUVs(tmp, yMin, yMax);
-    geo.setAttribute('uv', tmp.getAttribute('uv'));
-
-    const material = new THREE.MeshStandardMaterial({
-      map: peel,
-      roughness: 0.72,
-      metalness: 0,
-    });
-    materials.push(material);
-    mesh.material = material;
-  });
-
-  return materials;
-}
-
-function loadGltf(url: string) {
-  return new Promise<THREE.Group>((resolve, reject) => {
-    new GLTFLoader().load(
-      url,
-      (gltf) => resolve(gltf.scene),
-      undefined,
-      reject,
-    );
-  });
 }
 
 export default function ModelViewer({
   modelUrl,
   label,
-  borrowFromUrl,
+  skinAtlasUrl,
 }: {
   modelUrl: string;
   label: string;
-  /** Other body's GLB — its original textured look becomes one continuous peel map. */
-  borrowFromUrl?: string;
+  /** Other body's UV atlas — converted into one continuous skin map. */
+  skinAtlasUrl?: string;
 }) {
   const host = useRef<HTMLDivElement>(null);
 
@@ -250,40 +176,50 @@ export default function ModelViewer({
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.1;
+    renderer.toneMappingExposure = 1.12;
     el.appendChild(renderer.domElement);
 
     const group = new THREE.Group();
     scene.add(group);
 
     const materials: THREE.Material[] = [];
-    const targets: THREE.WebGLRenderTarget[] = [];
+    const textures: THREE.Texture[] = [];
     let cancelled = false;
 
-    (async () => {
-      try {
-        const model = await loadGltf(modelUrl);
+    new GLTFLoader().load(
+      modelUrl,
+      async (gltf) => {
         if (cancelled) return;
+        const model = gltf.scene;
         fitModel(model);
 
-        if (borrowFromUrl) {
-          const source = await loadGltf(borrowFromUrl);
-          if (cancelled) return;
-          fitModel(source);
-          const peel = bakeContinuousPeel(renderer, source);
-          targets.push(peel.target);
-          // Match peel vertical framing to the wearing body.
-          const body = worldBounds(model);
-          materials.push(
-            ...wrapWithPeel(model, peel.map, body.yMin, body.yMax),
-          );
+        if (skinAtlasUrl) {
+          try {
+            const skin = await atlasToContinuousSkin(skinAtlasUrl);
+            if (cancelled) {
+              skin.dispose();
+              return;
+            }
+            textures.push(skin);
+            // Dense enough to read as apple peel / fur, not stretched bands.
+            const material = makeTriplanarSkinMaterial(skin, 0.42);
+            materials.push(material);
+            model.traverse((node) => {
+              const mesh = node as THREE.Mesh;
+              if (mesh.isMesh) mesh.material = material;
+            });
+          } catch {
+            el.dataset.error = 'true';
+          }
         }
 
         if (!cancelled) group.add(model);
-      } catch {
+      },
+      undefined,
+      () => {
         el.dataset.error = 'true';
-      }
-    })();
+      },
+    );
 
     scene.add(new THREE.HemisphereLight(0xffffff, 0x242638, 2.7));
     const key = new THREE.DirectionalLight(0xffffff, 3.1);
@@ -356,11 +292,11 @@ export default function ModelViewer({
       el.removeEventListener('pointermove', move);
       el.removeEventListener('pointerup', end);
       for (const material of materials) material.dispose();
-      for (const target of targets) target.dispose();
+      for (const texture of textures) texture.dispose();
       renderer.dispose();
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement);
     };
-  }, [modelUrl, borrowFromUrl]);
+  }, [modelUrl, skinAtlasUrl]);
 
   return (
     <div
@@ -369,7 +305,7 @@ export default function ModelViewer({
       aria-label={`${label} uploaded 3D model`}
     >
       <span className="mesh-badge">
-        {borrowFromUrl ? 'CONTINUOUS PEEL MAP' : 'GLB + UV'}
+        {skinAtlasUrl ? 'FULL SKIN TEXTURE' : 'GLB + UV'}
       </span>
       <span className="orbit-hint">drag to orbit</span>
       <span className="axis">X&nbsp;&nbsp;Y&nbsp;&nbsp;Z</span>
