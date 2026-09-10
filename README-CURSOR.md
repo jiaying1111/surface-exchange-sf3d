@@ -1,21 +1,31 @@
-# Surface Exchange
+# Surface Exchange (standalone)
 
-Upload two object photos → Hugging Face **Stable Fast 3D** generates textured GLBs → detach UV atlases → exchange surfaces → archive both models and both UV maps in the Gallery.
+Independent Vite + Express app. Upload two photos → Hugging Face **Stable Fast 3D** → detach UV atlases → exchange surfaces → save both GLBs + UV maps to Gallery.
+
+No ChatGPT Sites / vinext hosting.
+
+## Run locally
 
 ```bash
 npm install
+cp .env.example .env   # optional: set HF_TOKEN
 npm run dev
 ```
 
-## Hugging Face
+- Web: http://localhost:5173  
+- API: http://localhost:8787  
 
-1. Create a token at https://huggingface.co/settings/tokens with access to [Upsampler/stable-fast-3d](https://huggingface.co/spaces/Upsampler/stable-fast-3d).
-2. Click **GENERATE REAL 3D** and paste the token when prompted (used only for that request), **or** set `HF_TOKEN` in `.env.local`.
+Click **GENERATE REAL 3D** and paste a Hugging Face token (or set `HF_TOKEN` in `.env`).
 
-Optional env (see `.env.example`):
+## Production
 
-- `SF3D_SPACE_ID` — default `Upsampler/stable-fast-3d`
-- `SF3D_API_NAME` — default `/image_to_glb`
-- `HF_TOKEN` — optional server fallback
+```bash
+npm run build
+npm start
+```
 
-Gallery and temporary GLBs need R2 (`ASSETS` in `.openai/hosting.json`).
+Serves the built UI and API on `PORT` (default `8787`).
+
+## Deploy
+
+Push to GitHub, then deploy the Node service anywhere that supports long-running requests (Railway, Render, Fly.io). Set `HF_TOKEN` in the host secrets.
