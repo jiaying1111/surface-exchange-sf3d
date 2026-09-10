@@ -432,7 +432,7 @@ export default function Home() {
       <div className="intro three-intro">
         <div>
           <span className="kicker">
-            IMAGE → SF3D MESH → SURFACE ATLAS → REPROJECT
+            IMAGE → SF3D MESH → SURFACE ATLAS → BAKE TEXTURE MAP
           </span>
           <h1>
             Two real bodies.
@@ -558,9 +558,9 @@ export default function Home() {
             {busy
               ? 'The free GPU may queue. Keep this tab open while both bodies form.'
               : detached
-                ? 'Atlases are source skins. Exchange reprojects each full material onto the other body.'
+                ? 'Exchange bakes each borrowed skin into a real texture map on the other body UVs.'
                 : generated
-                  ? 'Detach both surfaces, then reproject each skin onto the other body.'
+                  ? 'Detach both surfaces, then bake each skin onto the other body as a texture map.'
                   : "Add two isolated photos. Generation runs on this app's own Node API via Hugging Face Stable Fast 3D."}
           </p>
           {error && (
@@ -599,7 +599,7 @@ export default function Home() {
               ) : archiveState === 'error' ? (
                 'COULD NOT SAVE THIS PAIR'
               ) : (
-                'THE BODIES REMAIN. EACH WEARS THE OTHER SKIN BY TRIPLANAR REPROJECTION.'
+                'THE BODIES REMAIN. EACH WEARS A BAKED TEXTURE MAP OF THE OTHER SKIN.'
               )}
             </small>
           </div>
