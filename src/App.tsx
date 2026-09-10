@@ -73,28 +73,59 @@ async function generateOne(image: string, token: string) {
     throw new Error(explainFailure(error));
   }
 
-  const text = await response.text();
-  let data: { error?: string; modelUrl?: string } = {};
+  const startText = await response.text();
+  let start: { error?: string; jobId?: string; modelUrl?: string } = {};
   try {
-    data = text ? JSON.parse(text) : {};
+    start = startText ? JSON.parse(startText) : {};
   } catch {
     throw new Error(
-      response.ok
-        ? 'Stable Fast 3D returned an unreadable response.'
-        : explainFailure(new Error(`HTTP ${response.status}: ${text.slice(0, 80)}`)),
+      explainFailure(
+        new Error(`HTTP ${response.status}: ${startText.slice(0, 80)}`),
+      ),
     );
   }
-  if (!response.ok) {
-    throw new Error(explainFailure(new Error(data.error || `HTTP ${response.status}`)));
+  if (!response.ok && response.status !== 202) {
+    throw new Error(
+      explainFailure(new Error(start.error || `HTTP ${response.status}`)),
+    );
   }
-  if (!data.modelUrl) throw new Error('Stable Fast 3D returned no model URL.');
 
-  const binary = await fetch(data.modelUrl).then((res) => {
+  // Legacy sync response
+  let modelUrl = start.modelUrl;
+  if (!modelUrl && start.jobId) {
+    const statusUrl = `/api/sf3d/${start.jobId}`;
+    const deadline = Date.now() + 8 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const statusRes = await fetch(statusUrl);
+      const status = (await statusRes.json()) as {
+        status?: string;
+        modelUrl?: string;
+        error?: string;
+      };
+      if (!statusRes.ok) {
+        throw new Error(status.error || 'Generation job failed.');
+      }
+      if (status.status === 'done' && status.modelUrl) {
+        modelUrl = status.modelUrl;
+        break;
+      }
+      if (status.status === 'error') {
+        throw new Error(status.error || 'Stable Fast 3D generation failed.');
+      }
+    }
+    if (!modelUrl) {
+      throw new Error('Stable Fast 3D timed out. Please try again.');
+    }
+  }
+  if (!modelUrl) throw new Error('Stable Fast 3D returned no model URL.');
+
+  const binary = await fetch(modelUrl).then((res) => {
     if (!res.ok) throw new Error('Could not download the generated GLB.');
     return res.blob();
   });
   return {
-    url: data.modelUrl,
+    url: modelUrl,
     file: new File([binary], 'stable-fast-3d.glb', {
       type: 'model/gltf-binary',
     }),

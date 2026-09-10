@@ -10,6 +10,13 @@ const DEFAULT_ENDPOINT = process.env.SF3D_API_NAME || '/image_to_glb';
 
 type GradioFile = { url?: string; path?: string };
 
+type Job =
+  | { status: 'queued' | 'running'; createdAt: number }
+  | { status: 'done'; createdAt: number; modelUrl: string }
+  | { status: 'error'; createdAt: number; error: string };
+
+const jobs = new Map<string, Job>();
+
 function dataUrlToBlob(dataUrl: string) {
   const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);
   if (!match) throw new Error('Please upload a PNG, JPEG, or WebP image.');
@@ -30,18 +37,22 @@ async function imageFromRequest(req: Request) {
   throw new Error('Missing image.');
 }
 
-export async function generateSf3d(req: Request, res: Response) {
-  try {
-    const token =
-      (req.headers['x-hf-token'] as string | undefined) || process.env.HF_TOKEN;
-    if (!token) {
-      res.status(401).json({
-        error: 'Enter a Hugging Face token before generating.',
-      });
-      return;
-    }
+function explain(raw: string) {
+  if (raw.includes('ZeroGPU runs limit')) {
+    return 'Free GPU quota is exhausted. Use a Hugging Face Pro token or try again after the quota resets.';
+  }
+  if (raw === 'An error occurred') {
+    return 'The free SF3D GPU is temporarily unavailable. Please wait a minute and try again.';
+  }
+  if (/load failed|failed to fetch|networkerror|ENOTFOUND|ECONNRESET/i.test(raw)) {
+    return 'Could not reach Hugging Face Stable Fast 3D. Check your token and network, then try again.';
+  }
+  return raw || 'Stable Fast 3D generation failed.';
+}
 
-    const blob = await imageFromRequest(req);
+async function runJob(jobId: string, blob: Blob, token: string) {
+  jobs.set(jobId, { status: 'running', createdAt: Date.now() });
+  try {
     const client = await Client.connect(DEFAULT_SPACE, {
       token: token as `hf_${string}`,
     });
@@ -66,19 +77,50 @@ export async function generateSf3d(req: Request, res: Response) {
     const bytes = Buffer.from(await downloaded.arrayBuffer());
     const id = randomUUID();
     await writeFile(path.join(temporaryDir, `${id}.glb`), bytes);
-
-    res.json({ modelUrl: `/api/generated/${id}` });
+    jobs.set(jobId, {
+      status: 'done',
+      createdAt: Date.now(),
+      modelUrl: `/api/generated/${id}`,
+    });
   } catch (error) {
     const raw = error instanceof Error ? error.message : '';
-    const message = raw.includes('ZeroGPU runs limit')
-      ? 'Free GPU quota is exhausted. Use a Hugging Face Pro token or try again after the quota resets.'
-      : raw === 'An error occurred'
-        ? 'The free SF3D GPU is temporarily unavailable. Please wait a minute and try again.'
-        : /load failed|failed to fetch|networkerror|ENOTFOUND|ECONNRESET/i.test(
-              raw,
-            )
-          ? 'Could not reach Hugging Face Stable Fast 3D. Check your token and network, then try again.'
-          : raw || 'Stable Fast 3D generation failed.';
-    res.status(502).json({ error: message });
+    jobs.set(jobId, {
+      status: 'error',
+      createdAt: Date.now(),
+      error: explain(raw),
+    });
   }
+}
+
+export async function generateSf3d(req: Request, res: Response) {
+  try {
+    const token =
+      (req.headers['x-hf-token'] as string | undefined) || process.env.HF_TOKEN;
+    if (!token) {
+      res.status(401).json({
+        error: 'Enter a Hugging Face token before generating.',
+      });
+      return;
+    }
+
+    const blob = await imageFromRequest(req);
+    const jobId = randomUUID();
+    jobs.set(jobId, { status: 'queued', createdAt: Date.now() });
+    // Run Gradio off the request path so proxies/tunnels stay healthy.
+    void runJob(jobId, blob, token);
+    res.status(202).json({ jobId, statusUrl: `/api/sf3d/${jobId}` });
+  } catch (error) {
+    const raw = error instanceof Error ? error.message : '';
+    res.status(400).json({ error: explain(raw) });
+  }
+}
+
+export function getSf3dJob(req: Request, res: Response) {
+  const jobId = String(req.params.id || '');
+  const job = jobs.get(jobId);
+  if (!job) {
+    res.status(404).json({ error: 'Job not found.' });
+    return;
+  }
+  res.json(job);
 }
