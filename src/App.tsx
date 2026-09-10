@@ -432,7 +432,7 @@ export default function Home() {
       <div className="intro three-intro">
         <div>
           <span className="kicker">
-            IMAGE → SF3D MESH → UV ATLAS → EXCHANGE
+            IMAGE → SF3D MESH → SURFACE ATLAS → REPROJECT
           </span>
           <h1>
             Two real bodies.
@@ -558,9 +558,9 @@ export default function Home() {
             {busy
               ? 'The free GPU may queue. Keep this tab open while both bodies form.'
               : detached
-                ? 'The two UV atlases are now independent, persistent surfaces.'
+                ? 'Atlases are source skins. Exchange reprojects each full material onto the other body.'
                 : generated
-                  ? 'Detach both surfaces before they can travel.'
+                  ? 'Detach both surfaces, then reproject each skin onto the other body.'
                   : "Add two isolated photos. Generation runs on this app's own Node API via Hugging Face Stable Fast 3D."}
           </p>
           {error && (
@@ -599,7 +599,7 @@ export default function Home() {
               ) : archiveState === 'error' ? (
                 'COULD NOT SAVE THIS PAIR'
               ) : (
-                'THE BODIES REMAIN. THEIR UV MAPS HAVE CHANGED PLACES.'
+                'THE BODIES REMAIN. EACH WEARS THE OTHER SKIN BY TRIPLANAR REPROJECTION.'
               )}
             </small>
           </div>
